@@ -1,0 +1,18 @@
+[book]
+title = "µScope Trace Format Specification"
+authors = ["µScope Contributors"]
+src = "src"
+
+[output.html]
+default-theme = "light"
+additional-js = ["mermaid.min.js", "mermaid-init.js"]
+additional-css = ["svgbob.css"]
+
+[preprocessor.mermaid]
+command = "mdbook-mermaid"
+
+[preprocessor.svgbob]
+command = "./mdbook-svgbob-pre.sh"
+
+[output.html.fold]
+enable = true

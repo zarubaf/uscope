@@ -1,0 +1,29 @@
+.svgbob text {
+    white-space: pre;
+    fill: var(--fg, #333);
+    font-family: 'Source Code Pro', 'Iosevka Fixed', monospace;
+    font-size: 14px;
+}
+.svgbob rect.backdrop {
+    stroke: none;
+    fill: var(--bg, #fff);
+}
+.svgbob .filled {
+    fill: var(--fg, #333);
+}
+.svgbob .bg_filled {
+    fill: var(--bg, #fff);
+    stroke: var(--fg, #333);
+    stroke-width: 1;
+}
+.svgbob .nofill {
+    fill: var(--bg, #fff);
+}
+.svgbob .broken {
+    stroke-dasharray: 8;
+}
+.svgbob line, .svgbob path, .svgbob circle, .svgbob rect:not(.backdrop), .svgbob polygon {
+    stroke: var(--fg, #333);
+}
+.svgbob .end_marked_arrow   { marker-end: url(#arrow); }
+.svgbob .start_marked_arrow { marker-start: url(#arrow); }

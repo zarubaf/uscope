@@ -153,14 +153,15 @@ fn scan_pass(path: &str) -> io::Result<ScanResult> {
 }
 
 /// Extract PC from a disassembly label if it starts with a hex address.
+/// Handles formats like "00001000: jal zero, 0x10" and "0x80000000 addi x1, x0, 1".
 fn extract_pc(text: &str) -> u64 {
     let trimmed = text.trim();
-    // Try to parse the first whitespace-delimited token as a hex address
     if let Some(first_word) = trimmed.split_whitespace().next() {
+        // Strip trailing colon (e.g. "00001000:" → "00001000")
+        let word = first_word.strip_suffix(':').unwrap_or(first_word);
         // Strip optional "0x" prefix
-        let hex_str = first_word.strip_prefix("0x").unwrap_or(first_word);
+        let hex_str = word.strip_prefix("0x").unwrap_or(word);
         if let Ok(pc) = u64::from_str_radix(hex_str, 16) {
-            // Sanity check: the hex string should be at least 4 chars
             if hex_str.len() >= 4 {
                 return pc;
             }

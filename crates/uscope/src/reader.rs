@@ -4,7 +4,7 @@
 use crate::checkpoint::{FieldOffsets, StorageState};
 use crate::schema::Schema;
 use crate::segment;
-use crate::state::{self, TimedEvent, TraceState};
+use crate::state::{self, TimedEvent, TimedOp, TraceState};
 use crate::types::*;
 use std::fs::File;
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
@@ -243,7 +243,7 @@ impl Reader {
         };
 
         let compact = self.header.flags & F_COMPACT_DELTAS != 0;
-        let (final_time, _events) = state::replay_deltas(
+        let (final_time, _events, _ops) = state::replay_deltas(
             &delta_data,
             &mut storages,
             &self.field_offsets,
@@ -308,7 +308,7 @@ impl Reader {
                 .map(StorageState::new)
                 .collect();
 
-            let (_final_time, events) = state::replay_deltas(
+            let (_final_time, events, _ops) = state::replay_deltas(
                 &delta_data,
                 &mut storages,
                 &self.field_offsets,
@@ -325,6 +325,65 @@ impl Reader {
         }
 
         Ok(all_events)
+    }
+
+    /// Number of segments in the trace.
+    pub fn segment_count(&self) -> usize {
+        self.segment_table.len()
+    }
+
+    /// Replay a single segment, returning storage states, events, and ops.
+    pub fn segment_replay(
+        &mut self,
+        seg_idx: usize,
+    ) -> io::Result<(Vec<StorageState>, Vec<TimedEvent>, Vec<TimedOp>)> {
+        if seg_idx >= self.segment_table.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "segment index out of range",
+            ));
+        }
+
+        let seg_entry = &self.segment_table[seg_idx];
+        self.file.seek(SeekFrom::Start(seg_entry.offset))?;
+        let seg_header = SegmentHeader::read_from(&mut self.file)?;
+
+        // Read checkpoint
+        let mut storages: Vec<StorageState> = self
+            .schema
+            .storages
+            .iter()
+            .map(StorageState::new)
+            .collect();
+
+        for storage_state in &mut storages {
+            let block = CheckpointBlock::read_from(&mut self.file)?;
+            storage_state.read_checkpoint(&mut self.file, block.size)?;
+        }
+
+        // Read and decompress deltas
+        let mut compressed = vec![0u8; seg_header.deltas_compressed_size as usize];
+        self.file.read_exact(&mut compressed)?;
+
+        let delta_data = if self.header.flags & F_COMPRESSED != 0 {
+            lz4_flex::decompress_size_prepended(&compressed).map_err(|e| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("LZ4 decompress: {}", e))
+            })?
+        } else {
+            compressed
+        };
+
+        let compact = self.header.flags & F_COMPACT_DELTAS != 0;
+        let (_final_time, events, ops) = state::replay_deltas(
+            &delta_data,
+            &mut storages,
+            &self.field_offsets,
+            seg_header.time_start_ps,
+            None, // replay full segment
+            compact,
+        )?;
+
+        Ok((storages, events, ops))
     }
 
     /// Check for new segments (live tailing).

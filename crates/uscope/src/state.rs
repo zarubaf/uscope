@@ -48,6 +48,17 @@ pub struct TimedEvent {
     pub payload: Vec<u8>,
 }
 
+/// Storage operation observed during delta replay.
+#[derive(Debug, Clone)]
+pub struct TimedOp {
+    pub time_ps: u64,
+    pub storage_id: u16,
+    pub slot: u16,
+    pub action: u8,
+    pub field_index: u16,
+    pub value: u64,
+}
+
 /// Replay delta blob, starting from checkpoint state, up to a target time.
 /// Returns the final state and all events encountered.
 pub fn replay_deltas(
@@ -57,10 +68,11 @@ pub fn replay_deltas(
     start_time_ps: u64,
     target_time_ps: Option<u64>,
     compact_deltas: bool,
-) -> io::Result<(u64, Vec<TimedEvent>)> {
+) -> io::Result<(u64, Vec<TimedEvent>, Vec<TimedOp>)> {
     let mut cursor = Cursor::new(delta_data);
     let mut time_ps = start_time_ps;
     let mut events = Vec::new();
+    let mut ops = Vec::new();
 
     while (cursor.position() as usize) < delta_data.len() {
         // Read time_delta (LEB128)
@@ -92,6 +104,15 @@ pub fn replay_deltas(
 
             let sid = op.storage_id as usize;
             if sid < storages.len() {
+                ops.push(TimedOp {
+                    time_ps,
+                    storage_id: op.storage_id,
+                    slot: op.slot_index,
+                    action: op.action,
+                    field_index: op.field_index,
+                    value: op.value,
+                });
+
                 match op.action {
                     DA_SLOT_SET => {
                         storages[sid].set_field_at(
@@ -128,7 +149,7 @@ pub fn replay_deltas(
         }
     }
 
-    Ok((time_ps, events))
+    Ok((time_ps, events, ops))
 }
 
 #[cfg(test)]
@@ -177,11 +198,15 @@ mod tests {
         };
         op.write_to(&mut delta).unwrap();
 
-        let (final_time, events) =
+        let (final_time, events, ops) =
             replay_deltas(&delta, &mut storages, &offsets, 1000, None, false).unwrap();
 
         assert_eq!(final_time, 1000); // delta was 0
         assert!(events.is_empty());
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].action, DA_SLOT_SET);
+        assert_eq!(ops[0].slot, 2);
+        assert_eq!(ops[0].value, 42);
         assert!(storages[0].slot_valid(2));
         assert_eq!(storages[0].get_field_at(2, &offsets[0], 0), 42);
     }

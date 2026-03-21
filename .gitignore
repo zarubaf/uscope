@@ -1,1 +1,11 @@
 book/
+target/
+
+# C DPI build artifacts
+dpi/*.o
+dpi/*.a
+dpi/test_write
+dpi/test_output.uscope
+
+# Generated test data
+test_data/*.uscope

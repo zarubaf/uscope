@@ -1,6 +1,6 @@
 # µScope Trace Format Specification
 
-**Version:** 4.1-draft
+**Version:** 0.1-draft
 **Magic:** `uSCP` (0x75 0x53 0x43 0x50)
 **Byte order:** Little-endian (all multi-byte integers throughout the file,
 including field values in event payloads, checkpoint slot data, and summary
@@ -140,7 +140,7 @@ Offset 0. Fixed size: **48 bytes.**
 ```c
 typedef struct {
     uint8_t  magic[4];              // "uSCP" = {0x75, 0x53, 0x43, 0x50}
-    uint16_t version_major;         // 4
+    uint16_t version_major;         // 0
     uint16_t version_minor;         // 1
     uint64_t flags;                 // §2.1
     uint64_t total_time_ps;         // total trace duration in picoseconds (0 until finalized)
@@ -271,7 +271,7 @@ to avoid collisions in multi-protocol traces):
 | ------------------------ | ----------------- |
 | `dut_name`               | `boom_core_0`     |
 | `cpu.vendor`             | `acme`            |
-| `cpu.protocol_version`   | `1.0.0`           |
+| `cpu.protocol_version`   | `0.1`             |
 | `cpu.isa`                | `RV64IMAFDCV`     |
 | `cpu.pipeline_depth`     | `12`              |
 | `cpu.elf_path`           | `/path/to/fw.elf` |

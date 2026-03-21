@@ -1,8 +1,8 @@
 # µScope `cpu` Protocol Specification
 
-**Version:** 1.0-draft
+**Version:** 0.1-draft
 **Protocol identifier:** `cpu`
-**Transport version:** µScope 4.x
+**Transport version:** µScope 0.x
 
 ---
 
@@ -365,7 +365,7 @@ protocols in multi-protocol traces.
 | Key                      | Description                              | Example           |
 | ------------------------ | ---------------------------------------- | ----------------- |
 | `dut_name`               | DUT instance name                        | `boom_core_0`     |
-| `cpu.protocol_version`   | Version of the `cpu` protocol            | `1.0`             |
+| `cpu.protocol_version`   | Version of the `cpu` protocol            | `0.1`             |
 | `cpu.isa`                | Instruction set architecture             | `RV64GC`          |
 | `cpu.pipeline_stages`    | Comma-separated stage names, in order    | `fetch,...,retire` |
 
@@ -561,4 +561,4 @@ Cross-core events (cache coherence, IPIs) can be defined at the
 
 | Version | Date       | Changes         |
 | ------- | ---------- | --------------- |
-| 1.0     | 2026-xx-xx | Initial draft   |
+| 0.1     | 2026-xx-xx | Initial draft   |

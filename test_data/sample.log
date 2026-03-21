@@ -1,0 +1,27 @@
+Kanata	0004
+C=	0
+I	0	0	0
+L	0	0	80000000 addi x0, x0, 0
+S	0	0	Fetch
+C	1
+S	1	0	Fetch
+I	1	1	0
+L	1	0	80000004 addi x1, x0, 1
+E	0	0	Fetch
+S	0	0	Decode
+C	1
+E	1	0	Fetch
+S	1	0	Decode
+E	0	0	Decode
+S	0	0	Execute
+C	1
+E	1	0	Decode
+S	1	0	Execute
+E	0	0	Execute
+S	0	0	Writeback
+R	0	0	0
+C	1
+E	1	0	Execute
+S	1	0	Writeback
+R	1	1	0
+W	1	0	0

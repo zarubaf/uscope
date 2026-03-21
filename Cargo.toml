@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "crates/uscope",
+    "crates/konata2uscope",
+]
+resolver = "2"

@@ -1,0 +1,13 @@
+[package]
+name = "uscope"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Reader and writer for the µScope hardware trace format"
+
+[dependencies]
+byteorder = "1"
+lz4_flex = "0.11"
+
+[dev-dependencies]
+tempfile = "3.27.0"

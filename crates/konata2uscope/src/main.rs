@@ -1,7 +1,6 @@
 /// konata2uscope: Convert Konata (Kanata v0004) pipeline trace logs to µScope format.
 ///
 /// Usage: konata2uscope input.log -o output.uscope [--clock-period-ps 1000] [--dut-name "core0"]
-
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
@@ -20,15 +19,31 @@ enum KonataCmd {
     /// I\t<id>\t<gid>\t<tid> — create instruction
     Instruction { id: u32, _gid: u32, tid: u32 },
     /// L\t<id>\t<type>\t<text> — label
-    Label { id: u32, label_type: u32, text: String },
+    Label {
+        id: u32,
+        label_type: u32,
+        text: String,
+    },
     /// S\t<id>\t<lane>\t<stage> — start stage
     StageStart { id: u32, lane: u32, stage: String },
     /// E\t<id>\t<lane>\t<stage> — end stage
-    StageEnd { _id: u32, _lane: u32, _stage: String },
+    StageEnd {
+        _id: u32,
+        _lane: u32,
+        _stage: String,
+    },
     /// R\t<id>\t<rid>\t<type> — retire (0) or flush (1)
-    Retire { id: u32, _rid: u32, retire_type: u32 },
+    Retire {
+        id: u32,
+        _rid: u32,
+        retire_type: u32,
+    },
     /// W\t<consumer>\t<producer>\t<type> — dependency
-    Dependency { consumer: u32, producer: u32, _dep_type: u32 },
+    Dependency {
+        consumer: u32,
+        producer: u32,
+        _dep_type: u32,
+    },
 }
 
 fn parse_line(line: &str) -> Option<KonataCmd> {
@@ -56,7 +71,11 @@ fn parse_line(line: &str) -> Option<KonataCmd> {
             let id: u32 = parts.get(1)?.parse().ok()?;
             let label_type: u32 = parts.get(2)?.parse().ok()?;
             let text = parts.get(3).unwrap_or(&"").to_string();
-            Some(KonataCmd::Label { id, label_type, text })
+            Some(KonataCmd::Label {
+                id,
+                label_type,
+                text,
+            })
         }
         "S" => {
             let id: u32 = parts.get(1)?.parse().ok()?;
@@ -68,19 +87,31 @@ fn parse_line(line: &str) -> Option<KonataCmd> {
             let id: u32 = parts.get(1)?.parse().ok()?;
             let lane: u32 = parts.get(2)?.parse().ok()?;
             let stage = parts.get(3)?.to_string();
-            Some(KonataCmd::StageEnd { _id: id, _lane: lane, _stage: stage })
+            Some(KonataCmd::StageEnd {
+                _id: id,
+                _lane: lane,
+                _stage: stage,
+            })
         }
         "R" => {
             let id: u32 = parts.get(1)?.parse().ok()?;
             let rid: u32 = parts.get(2)?.parse().ok()?;
             let retire_type: u32 = parts.get(3)?.parse().ok()?;
-            Some(KonataCmd::Retire { id, _rid: rid, retire_type })
+            Some(KonataCmd::Retire {
+                id,
+                _rid: rid,
+                retire_type,
+            })
         }
         "W" => {
             let consumer: u32 = parts.get(1)?.parse().ok()?;
             let producer: u32 = parts.get(2)?.parse().ok()?;
             let dep_type: u32 = parts.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
-            Some(KonataCmd::Dependency { consumer, producer, _dep_type: dep_type })
+            Some(KonataCmd::Dependency {
+                consumer,
+                producer,
+                _dep_type: dep_type,
+            })
         }
         _ => None,
     }
@@ -251,7 +282,11 @@ fn emit_pass(
                     cpu.fetch(&mut w, id, 0, 0);
                     entity_pc.insert(id, 0);
                 }
-                KonataCmd::Label { id, label_type, text } => {
+                KonataCmd::Label {
+                    id,
+                    label_type,
+                    text,
+                } => {
                     let time_ps = current_cycle * clock_period_ps;
                     if !cycle_started || time_ps != last_time_ps {
                         if cycle_started {
@@ -266,12 +301,7 @@ fn emit_pass(
                         // Disassembly: extract PC and set it
                         let pc = extract_pc(&text);
                         if pc != 0 {
-                            w.slot_set(
-                                ids.entities_storage_id,
-                                id as u16,
-                                ids.field_pc,
-                                pc,
-                            );
+                            w.slot_set(ids.entities_storage_id, id as u16, ids.field_pc, pc);
                             entity_pc.insert(id, pc);
                         }
                     }
@@ -302,7 +332,9 @@ fn emit_pass(
                     // Stage ends don't need explicit tracking in uscope
                     // (next stage_transition or retire implicitly ends the previous)
                 }
-                KonataCmd::Retire { id, retire_type, .. } => {
+                KonataCmd::Retire {
+                    id, retire_type, ..
+                } => {
                     let time_ps = current_cycle * clock_period_ps;
                     if !cycle_started || time_ps != last_time_ps {
                         if cycle_started {
@@ -323,7 +355,9 @@ fn emit_pass(
                     }
                     entity_pc.remove(&id);
                 }
-                KonataCmd::Dependency { consumer, producer, .. } => {
+                KonataCmd::Dependency {
+                    consumer, producer, ..
+                } => {
                     let time_ps = current_cycle * clock_period_ps;
                     if !cycle_started || time_ps != last_time_ps {
                         if cycle_started {

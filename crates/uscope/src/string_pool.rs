@@ -1,6 +1,5 @@
 /// Schema-level string pool: packed null-terminated UTF-8 strings, max 64 KB.
 /// Offsets are u16, used by DUT properties, scope names, field names, etc.
-
 use std::collections::HashMap;
 
 /// Builds a string pool by inserting strings and returning their offsets.

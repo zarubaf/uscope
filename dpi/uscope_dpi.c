@@ -21,6 +21,11 @@ static const uint8_t SEG_MAGIC[4] = {0x75, 0x53, 0x45, 0x47}; /* "uSEG" */
 #define F_COMPRESSED     (1ULL << 1)
 #define F_HAS_STRINGS    (1ULL << 2)
 #define F_COMPACT_DELTAS (1ULL << 6)
+#define F_INTERLEAVED_DELTAS (1ULL << 7)
+
+#define TAG_WIDE_OP    0x01
+#define TAG_COMPACT_OP 0x02
+#define TAG_EVENT      0x03
 
 #define CHUNK_END         0x0000
 #define CHUNK_DUT_DESC    0x0001
@@ -444,6 +449,9 @@ struct uscope_writer {
     uint16_t    num_ops;
     event_rec_t events[MAX_EVENTS_PER_FRAME];
     uint16_t    num_events;
+    /* v0.2 interleaved order tracking: (is_event<<15) | index */
+    uint16_t    item_order[MAX_OPS_PER_FRAME + MAX_EVENTS_PER_FRAME];
+    uint16_t    num_items;
     uint64_t    current_time_ps;
     int         in_cycle;
 
@@ -606,13 +614,13 @@ uscope_writer_t *uscope_writer_open(const char *path,
 
     uscope_writer_t *w = calloc(1, sizeof(*w));
     w->fp = fp;
-    w->flags = F_COMPRESSED | F_COMPACT_DELTAS;
+    w->flags = F_COMPRESSED | F_INTERLEAVED_DELTAS;
     w->checkpoint_interval_ps = checkpoint_interval_ps;
 
     /* Write file header (placeholder) */
     fwrite(MAGIC, 1, 4, fp);
     write_u16(fp, 0); /* version_major */
-    write_u16(fp, 1); /* version_minor */
+    write_u16(fp, 2); /* version_minor */
     write_u64(fp, w->flags);
     write_u64(fp, 0); /* total_time_ps */
     write_u32(fp, 0); /* num_segments */
@@ -668,7 +676,7 @@ uscope_writer_t *uscope_writer_open(const char *path,
     fseek(fp, 0, SEEK_SET);
     fwrite(MAGIC, 1, 4, fp);
     write_u16(fp, 0);
-    write_u16(fp, 1);
+    write_u16(fp, 2);
     write_u64(fp, w->flags);
     write_u64(fp, 0);
     write_u32(fp, 0);
@@ -767,7 +775,7 @@ static void flush_segment(uscope_writer_t *w) {
     fseek(w->fp, 0, SEEK_SET);
     fwrite(MAGIC, 1, 4, w->fp);
     write_u16(w->fp, 0);
-    write_u16(w->fp, 1);
+    write_u16(w->fp, 2);
     write_u64(w->fp, w->flags);
     write_u64(w->fp, w->total_time_ps);
     write_u32(w->fp, w->num_segments);
@@ -794,18 +802,21 @@ void uscope_begin_cycle(uscope_writer_t *w, uint64_t time_ps) {
     w->in_cycle = 1;
     w->num_ops = 0;
     w->num_events = 0;
+    w->num_items = 0;
 }
 
 void uscope_slot_set(uscope_writer_t *w, uint16_t storage_id,
                      uint16_t slot, uint16_t field, uint64_t value) {
     assert(w->in_cycle);
     if (w->num_ops < MAX_OPS_PER_FRAME) {
-        delta_op_t *op = &w->ops[w->num_ops++];
+        uint16_t idx = w->num_ops++;
+        delta_op_t *op = &w->ops[idx];
         op->action = DA_SLOT_SET;
         op->storage_id = storage_id;
         op->slot_index = slot;
         op->field_index = field;
         op->value = value;
+        w->item_order[w->num_items++] = idx; /* op index, bit 15 clear */
     }
     if (storage_id < w->num_storages)
         state_set_field(&w->states[storage_id], slot, field, value);
@@ -815,12 +826,14 @@ void uscope_slot_clear(uscope_writer_t *w, uint16_t storage_id,
                        uint16_t slot) {
     assert(w->in_cycle);
     if (w->num_ops < MAX_OPS_PER_FRAME) {
-        delta_op_t *op = &w->ops[w->num_ops++];
+        uint16_t idx = w->num_ops++;
+        delta_op_t *op = &w->ops[idx];
         op->action = DA_SLOT_CLEAR;
         op->storage_id = storage_id;
         op->slot_index = slot;
         op->field_index = 0;
         op->value = 0;
+        w->item_order[w->num_items++] = idx;
     }
     if (storage_id < w->num_storages)
         state_clear_slot(&w->states[storage_id], slot);
@@ -830,12 +843,14 @@ void uscope_slot_add(uscope_writer_t *w, uint16_t storage_id,
                      uint16_t slot, uint16_t field, uint64_t value) {
     assert(w->in_cycle);
     if (w->num_ops < MAX_OPS_PER_FRAME) {
-        delta_op_t *op = &w->ops[w->num_ops++];
+        uint16_t idx = w->num_ops++;
+        delta_op_t *op = &w->ops[idx];
         op->action = DA_SLOT_ADD;
         op->storage_id = storage_id;
         op->slot_index = slot;
         op->field_index = field;
         op->value = value;
+        w->item_order[w->num_items++] = idx;
     }
     if (storage_id < w->num_storages)
         state_add_field(&w->states[storage_id], slot, field, value);
@@ -845,11 +860,13 @@ void uscope_event(uscope_writer_t *w, uint16_t event_type_id,
                   const void *payload, uint32_t payload_size) {
     assert(w->in_cycle);
     if (w->num_events < MAX_EVENTS_PER_FRAME && payload_size <= 256) {
-        event_rec_t *ev = &w->events[w->num_events++];
+        uint16_t idx = w->num_events++;
+        event_rec_t *ev = &w->events[idx];
         ev->event_type_id = event_type_id;
         ev->payload_size = payload_size;
         if (payload_size > 0)
             memcpy(ev->payload, payload, payload_size);
+        w->item_order[w->num_items++] = (1u << 15) | idx; /* event, bit 15 set */
     }
 }
 
@@ -874,7 +891,7 @@ void uscope_end_cycle(uscope_writer_t *w) {
     }
 
     /* Ensure delta buffer has space */
-    uint32_t needed = 10 + 6 + (uint32_t)w->num_ops * 16 +
+    uint32_t needed = 10 + 2 + (uint32_t)w->num_items * 17 +
                       (uint32_t)w->num_events * 264;
     if (w->delta_buf_len + needed > w->delta_buf_cap) {
         w->delta_buf_cap *= 2;
@@ -886,44 +903,41 @@ void uscope_end_cycle(uscope_writer_t *w) {
     /* LEB128 time delta */
     p += leb128_encode(time_delta, p);
 
-    /* op_format */
-    *p++ = use_compact ? 1 : 0;
-    /* reserved */
-    *p++ = 0;
-    /* num_ops */
-    buf_u16(&p, w->num_ops);
-    /* num_events */
-    buf_u16(&p, w->num_events);
+    /* v0.2: num_items */
+    buf_u16(&p, w->num_items);
 
-    /* Ops */
-    for (uint16_t i = 0; i < w->num_ops; i++) {
-        const delta_op_t *op = &w->ops[i];
-        if (use_compact) {
-            /* 8-byte compact op */
-            *p++ = op->action;
-            *p++ = (uint8_t)op->storage_id;
-            buf_u16(&p, op->slot_index);
-            buf_u16(&p, op->field_index);
-            buf_u16(&p, (uint16_t)op->value);
-        } else {
-            /* 16-byte wide op */
-            *p++ = op->action;
+    /* Items in insertion order */
+    for (uint16_t i = 0; i < w->num_items; i++) {
+        uint16_t entry = w->item_order[i];
+        int is_event = (entry >> 15) & 1;
+        uint16_t idx = entry & 0x7FFF;
+
+        if (is_event) {
+            const event_rec_t *ev = &w->events[idx];
+            *p++ = TAG_EVENT;
             *p++ = 0; /* reserved */
-            buf_u16(&p, op->storage_id);
-            buf_u16(&p, op->slot_index);
-            buf_u16(&p, op->field_index);
-            buf_u64(&p, op->value);
+            buf_u16(&p, ev->event_type_id);
+            buf_u32(&p, ev->payload_size);
+            memcpy(p, ev->payload, ev->payload_size);
+            p += ev->payload_size;
+        } else {
+            const delta_op_t *op = &w->ops[idx];
+            if (use_compact) {
+                *p++ = TAG_COMPACT_OP;
+                *p++ = op->action;
+                *p++ = (uint8_t)op->storage_id;
+                buf_u16(&p, op->slot_index);
+                buf_u16(&p, op->field_index);
+                buf_u16(&p, (uint16_t)op->value);
+            } else {
+                *p++ = TAG_WIDE_OP;
+                *p++ = op->action;
+                buf_u16(&p, op->storage_id);
+                buf_u16(&p, op->slot_index);
+                buf_u16(&p, op->field_index);
+                buf_u64(&p, op->value);
+            }
         }
-    }
-
-    /* Events */
-    for (uint16_t i = 0; i < w->num_events; i++) {
-        const event_rec_t *ev = &w->events[i];
-        buf_u16(&p, ev->event_type_id);
-        buf_u16(&p, 0); /* reserved */
-        buf_u32(&p, ev->payload_size);
-        memcpy(p, ev->payload, ev->payload_size);
-        p += ev->payload_size;
     }
 
     w->delta_buf_len = (uint32_t)(p - w->delta_buf);
@@ -1045,7 +1059,7 @@ void uscope_writer_close(uscope_writer_t *w) {
     fseek(w->fp, 0, SEEK_SET);
     fwrite(MAGIC, 1, 4, w->fp);
     write_u16(w->fp, 0);
-    write_u16(w->fp, 1);
+    write_u16(w->fp, 2);
     write_u64(w->fp, w->flags);
     write_u64(w->fp, w->total_time_ps);
     write_u32(w->fp, w->num_segments);

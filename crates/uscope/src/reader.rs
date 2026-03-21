@@ -1,10 +1,9 @@
 /// Reader for µScope trace files.
 /// Supports both finalized files and live tailing.
-
 use crate::checkpoint::{FieldOffsets, StorageState};
 use crate::schema::Schema;
 use crate::segment;
-use crate::state::{self, TimedEvent, TimedOp, TraceState};
+use crate::state::{self, TimedEvent, TimedItem, TraceState};
 use crate::types::*;
 use std::fs::File;
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
@@ -100,9 +99,8 @@ impl Reader {
             }
         }
 
-        let schema = schema.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "missing schema chunk")
-        })?;
+        let schema = schema
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing schema chunk"))?;
         let dut = dut.ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "missing DUT descriptor chunk")
         })?;
@@ -208,6 +206,20 @@ impl Reader {
         None
     }
 
+    /// Iterate over all DUT properties as (key, value) string pairs.
+    pub fn dut_properties(&self) -> Vec<(&str, &str)> {
+        let reader = crate::string_pool::StringPoolReader::new(&self.dut_string_pool);
+        self.dut
+            .properties
+            .iter()
+            .filter_map(|p| {
+                let key = reader.get(p.key)?;
+                let value = reader.get(p.value)?;
+                Some((key, value))
+            })
+            .collect()
+    }
+
     /// Reconstruct state at a given time.
     pub fn state_at(&mut self, time_ps: u64) -> io::Result<TraceState> {
         let seg_idx = segment::find_segment_for_time(&self.segment_table, time_ps)
@@ -218,12 +230,8 @@ impl Reader {
         let seg_header = SegmentHeader::read_from(&mut self.file)?;
 
         // Read checkpoint
-        let mut storages: Vec<StorageState> = self
-            .schema
-            .storages
-            .iter()
-            .map(StorageState::new)
-            .collect();
+        let mut storages: Vec<StorageState> =
+            self.schema.storages.iter().map(StorageState::new).collect();
 
         for storage_state in &mut storages {
             let block = CheckpointBlock::read_from(&mut self.file)?;
@@ -242,15 +250,29 @@ impl Reader {
             compressed
         };
 
-        let compact = self.header.flags & F_COMPACT_DELTAS != 0;
-        let (final_time, _events, _ops) = state::replay_deltas(
-            &delta_data,
-            &mut storages,
-            &self.field_offsets,
-            seg_header.time_start_ps,
-            Some(time_ps),
-            compact,
-        )?;
+        let interleaved = self.header.flags & F_INTERLEAVED_DELTAS != 0;
+
+        let final_time = if interleaved {
+            let (ft, _items) = state::replay_deltas_v2(
+                &delta_data,
+                &mut storages,
+                &self.field_offsets,
+                seg_header.time_start_ps,
+                Some(time_ps),
+            )?;
+            ft
+        } else {
+            let compact = self.header.flags & F_COMPACT_DELTAS != 0;
+            let (ft, _events, _ops) = state::replay_deltas(
+                &delta_data,
+                &mut storages,
+                &self.field_offsets,
+                seg_header.time_start_ps,
+                Some(time_ps),
+                compact,
+            )?;
+            ft
+        };
 
         Ok(TraceState {
             time_ps: final_time,
@@ -259,11 +281,7 @@ impl Reader {
     }
 
     /// Get all events in a time range.
-    pub fn events_in_range(
-        &mut self,
-        t0: u64,
-        t1: u64,
-    ) -> io::Result<Vec<TimedEvent>> {
+    pub fn events_in_range(&mut self, t0: u64, t1: u64) -> io::Result<Vec<TimedEvent>> {
         let mut all_events = Vec::new();
 
         // Find first and last segment
@@ -291,35 +309,45 @@ impl Reader {
 
             let delta_data = if self.header.flags & F_COMPRESSED != 0 {
                 lz4_flex::decompress_size_prepended(&compressed).map_err(|e| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("LZ4 decompress: {}", e),
-                    )
+                    io::Error::new(io::ErrorKind::InvalidData, format!("LZ4 decompress: {}", e))
                 })?
             } else {
                 compressed
             };
 
-            let compact = self.header.flags & F_COMPACT_DELTAS != 0;
-            let mut storages: Vec<StorageState> = self
-                .schema
-                .storages
-                .iter()
-                .map(StorageState::new)
-                .collect();
+            let interleaved = self.header.flags & F_INTERLEAVED_DELTAS != 0;
+            let mut storages: Vec<StorageState> =
+                self.schema.storages.iter().map(StorageState::new).collect();
 
-            let (_final_time, events, _ops) = state::replay_deltas(
-                &delta_data,
-                &mut storages,
-                &self.field_offsets,
-                seg_header.time_start_ps,
-                Some(t1),
-                compact,
-            )?;
-
-            for ev in events {
-                if ev.time_ps >= t0 && ev.time_ps <= t1 {
-                    all_events.push(ev);
+            if interleaved {
+                let (_final_time, items) = state::replay_deltas_v2(
+                    &delta_data,
+                    &mut storages,
+                    &self.field_offsets,
+                    seg_header.time_start_ps,
+                    Some(t1),
+                )?;
+                for item in items {
+                    if let state::TimedItem::Event(ev) = item {
+                        if ev.time_ps >= t0 && ev.time_ps <= t1 {
+                            all_events.push(ev);
+                        }
+                    }
+                }
+            } else {
+                let compact = self.header.flags & F_COMPACT_DELTAS != 0;
+                let (_final_time, events, _ops) = state::replay_deltas(
+                    &delta_data,
+                    &mut storages,
+                    &self.field_offsets,
+                    seg_header.time_start_ps,
+                    Some(t1),
+                    compact,
+                )?;
+                for ev in events {
+                    if ev.time_ps >= t0 && ev.time_ps <= t1 {
+                        all_events.push(ev);
+                    }
                 }
             }
         }
@@ -332,11 +360,11 @@ impl Reader {
         self.segment_table.len()
     }
 
-    /// Replay a single segment, returning storage states, events, and ops.
+    /// Replay a single segment, returning storage states and ordered items.
     pub fn segment_replay(
         &mut self,
         seg_idx: usize,
-    ) -> io::Result<(Vec<StorageState>, Vec<TimedEvent>, Vec<TimedOp>)> {
+    ) -> io::Result<(Vec<StorageState>, Vec<TimedItem>)> {
         if seg_idx >= self.segment_table.len() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -349,12 +377,8 @@ impl Reader {
         let seg_header = SegmentHeader::read_from(&mut self.file)?;
 
         // Read checkpoint
-        let mut storages: Vec<StorageState> = self
-            .schema
-            .storages
-            .iter()
-            .map(StorageState::new)
-            .collect();
+        let mut storages: Vec<StorageState> =
+            self.schema.storages.iter().map(StorageState::new).collect();
 
         for storage_state in &mut storages {
             let block = CheckpointBlock::read_from(&mut self.file)?;
@@ -373,17 +397,46 @@ impl Reader {
             compressed
         };
 
-        let compact = self.header.flags & F_COMPACT_DELTAS != 0;
-        let (_final_time, events, ops) = state::replay_deltas(
-            &delta_data,
-            &mut storages,
-            &self.field_offsets,
-            seg_header.time_start_ps,
-            None, // replay full segment
-            compact,
-        )?;
+        let interleaved = self.header.flags & F_INTERLEAVED_DELTAS != 0;
 
-        Ok((storages, events, ops))
+        if interleaved {
+            let (_final_time, items) = state::replay_deltas_v2(
+                &delta_data,
+                &mut storages,
+                &self.field_offsets,
+                seg_header.time_start_ps,
+                None,
+            )?;
+            Ok((storages, items))
+        } else {
+            // v0.1 fallback: separate ops/events, merge into TimedItem
+            let compact = self.header.flags & F_COMPACT_DELTAS != 0;
+            let (_final_time, events, ops) = state::replay_deltas(
+                &delta_data,
+                &mut storages,
+                &self.field_offsets,
+                seg_header.time_start_ps,
+                None,
+                compact,
+            )?;
+            let mut items: Vec<TimedItem> = Vec::with_capacity(ops.len() + events.len());
+            for op in ops {
+                items.push(TimedItem::Op(op));
+            }
+            for ev in events {
+                items.push(TimedItem::Event(ev));
+            }
+            // Sort by time, ops before events at same time (v0.1 compat)
+            items.sort_by_key(|item| {
+                let t = item.time_ps();
+                let order = match item {
+                    TimedItem::Op(_) => 0u8,
+                    TimedItem::Event(_) => 1u8,
+                };
+                (t, order)
+            });
+            Ok((storages, items))
+        }
     }
 
     /// Check for new segments (live tailing).

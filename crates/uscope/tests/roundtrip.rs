@@ -1,5 +1,4 @@
 /// Integration test: write a trace file, read it back, verify round-trip.
-
 use uscope::protocols::cpu::{CpuSchemaBuilder, CpuWriter};
 use uscope::reader::Reader;
 use uscope::types::*;

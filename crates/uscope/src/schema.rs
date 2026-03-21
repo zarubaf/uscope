@@ -1,5 +1,4 @@
 /// Schema builder and binary serialization for the µScope format.
-
 use crate::string_pool::StringPoolBuilder;
 use crate::types::*;
 use std::io::{self, Read, Write};
@@ -439,7 +438,10 @@ mod tests {
         assert_eq!(decoded.events[0].fields.len(), 2);
 
         // Check strings round-trip
-        assert_eq!(decoded.get_string(decoded.clock_domains[0].name), Some("core_clk"));
+        assert_eq!(
+            decoded.get_string(decoded.clock_domains[0].name),
+            Some("core_clk")
+        );
         assert_eq!(decoded.get_string(decoded.scopes[1].name), Some("core0"));
     }
 

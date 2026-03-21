@@ -1,6 +1,5 @@
 /// Cross-validation test: reads a trace file written by the C DPI library
 /// and verifies its contents match expectations.
-
 use uscope::reader::Reader;
 use uscope::types::*;
 
@@ -55,8 +54,14 @@ fn read_c_writer_output() {
 
     // State at t=4000: both retired
     let state2 = reader.state_at(4000).unwrap();
-    assert!(!state2.slot_valid(0, 0), "inst 0 should be retired at t=4000");
-    assert!(!state2.slot_valid(0, 1), "inst 1 should be retired at t=4000");
+    assert!(
+        !state2.slot_valid(0, 0),
+        "inst 0 should be retired at t=4000"
+    );
+    assert!(
+        !state2.slot_valid(0, 1),
+        "inst 1 should be retired at t=4000"
+    );
 
     // Events: should have stage transitions
     let events = reader.events_in_range(0, 4000).unwrap();

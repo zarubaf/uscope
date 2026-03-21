@@ -1,6 +1,5 @@
 /// CPU protocol helpers: schema construction and typed writer operations.
 /// Implements the CPU protocol conventions from the spec.
-
 use crate::schema::{DutDescBuilder, FieldSpec, SchemaBuilder};
 use crate::types::*;
 use crate::writer::Writer;
@@ -110,7 +109,12 @@ impl CpuSchemaBuilder {
         self
     }
 
-    pub fn buffer(mut self, name: &str, num_slots: u16, extra_fields: &[(&str, FieldSpec)]) -> Self {
+    pub fn buffer(
+        mut self,
+        name: &str,
+        num_slots: u16,
+        extra_fields: &[(&str, FieldSpec)],
+    ) -> Self {
         self.buffers.push(BufferDef {
             name: name.to_owned(),
             num_slots,
@@ -171,8 +175,10 @@ impl CpuSchemaBuilder {
         let stage_refs: Vec<&str> = self.pipeline_stages.iter().map(|s| s.as_str()).collect();
         let pipeline_stage_enum_id = sb.enum_type("pipeline_stage", &stage_refs);
         let dep_type_enum_id = sb.enum_type("dep_type", &["raw", "war", "waw", "structural"]);
-        let flush_reason_enum_id =
-            sb.enum_type("flush_reason", &["mispredict", "exception", "interrupt", "pipeline_clear"]);
+        let flush_reason_enum_id = sb.enum_type(
+            "flush_reason",
+            &["mispredict", "exception", "interrupt", "pipeline_clear"],
+        );
         let stall_refs: Vec<&str> = self.stall_reasons.iter().map(|s| s.as_str()).collect();
         let stall_reason_enum_id = sb.enum_type("stall_reason", &stall_refs);
 
@@ -300,12 +306,7 @@ impl CpuWriter {
     }
 
     /// Emit a stage transition event.
-    pub fn stage_transition<W: Write + Seek>(
-        &self,
-        w: &mut Writer<W>,
-        entity_id: u32,
-        stage: u8,
-    ) {
+    pub fn stage_transition<W: Write + Seek>(&self, w: &mut Writer<W>, entity_id: u32, stage: u8) {
         let mut payload = Vec::with_capacity(5);
         payload.extend_from_slice(&entity_id.to_le_bytes());
         payload.push(stage);
@@ -318,21 +319,20 @@ impl CpuWriter {
     }
 
     /// Flush an instruction.
+    ///
+    /// The flush event implicitly removes the entity from the active set.
+    /// No separate `slot_clear` is emitted — this avoids an ordering race
+    /// in the binary frame format where ops and events are stored in
+    /// separate arrays and the consumer cannot recover call order.
     pub fn flush<W: Write + Seek>(&self, w: &mut Writer<W>, entity_id: u32, reason: u8) {
         let mut payload = Vec::with_capacity(5);
         payload.extend_from_slice(&entity_id.to_le_bytes());
         payload.push(reason);
         w.event(self.ids.flush_event_id, &payload);
-        w.slot_clear(self.ids.entities_storage_id, entity_id as u16);
     }
 
     /// Annotate an entity with text.
-    pub fn annotate<W: Write + Seek>(
-        &self,
-        w: &mut Writer<W>,
-        entity_id: u32,
-        text: &str,
-    ) {
+    pub fn annotate<W: Write + Seek>(&self, w: &mut Writer<W>, entity_id: u32, text: &str) {
         let text_ref = w.string_table.insert(text);
         let mut payload = Vec::with_capacity(8);
         payload.extend_from_slice(&entity_id.to_le_bytes());
@@ -361,12 +361,7 @@ impl CpuWriter {
     }
 
     /// Increment a counter.
-    pub fn counter_add<W: Write + Seek>(
-        &self,
-        w: &mut Writer<W>,
-        counter_name: &str,
-        delta: u64,
-    ) {
+    pub fn counter_add<W: Write + Seek>(&self, w: &mut Writer<W>, counter_name: &str, delta: u64) {
         for (name, sid, field) in &self.ids.counters {
             if name == counter_name {
                 w.slot_add(*sid, 0, *field, delta);

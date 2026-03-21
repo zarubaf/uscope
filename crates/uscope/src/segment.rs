@@ -1,5 +1,4 @@
 /// Segment reading utilities: chain walking, binary search in segment table.
-
 use crate::types::*;
 use std::io::{self, Read, Seek, SeekFrom};
 
@@ -10,7 +9,10 @@ pub fn read_segment_at<R: Read + Seek>(r: &mut R, offset: u64) -> io::Result<Seg
 }
 
 /// Walk the segment chain backwards from tail_offset, collecting all segment headers.
-pub fn walk_chain<R: Read + Seek>(r: &mut R, tail_offset: u64) -> io::Result<Vec<(u64, SegmentHeader)>> {
+pub fn walk_chain<R: Read + Seek>(
+    r: &mut R,
+    tail_offset: u64,
+) -> io::Result<Vec<(u64, SegmentHeader)>> {
     let mut segments = Vec::new();
     let mut offset = tail_offset;
 
@@ -26,10 +28,7 @@ pub fn walk_chain<R: Read + Seek>(r: &mut R, tail_offset: u64) -> io::Result<Vec
 }
 
 /// Binary search the segment table for the segment containing the given time.
-pub fn find_segment_for_time(
-    table: &[SegmentIndexEntry],
-    time_ps: u64,
-) -> Option<usize> {
+pub fn find_segment_for_time(table: &[SegmentIndexEntry], time_ps: u64) -> Option<usize> {
     if table.is_empty() {
         return None;
     }
@@ -74,9 +73,21 @@ mod tests {
     #[test]
     fn binary_search_segments() {
         let table = vec![
-            SegmentIndexEntry { offset: 0, time_start_ps: 0, time_end_ps: 1000 },
-            SegmentIndexEntry { offset: 100, time_start_ps: 1000, time_end_ps: 2000 },
-            SegmentIndexEntry { offset: 200, time_start_ps: 2000, time_end_ps: 3000 },
+            SegmentIndexEntry {
+                offset: 0,
+                time_start_ps: 0,
+                time_end_ps: 1000,
+            },
+            SegmentIndexEntry {
+                offset: 100,
+                time_start_ps: 1000,
+                time_end_ps: 2000,
+            },
+            SegmentIndexEntry {
+                offset: 200,
+                time_start_ps: 2000,
+                time_end_ps: 3000,
+            },
         ];
 
         assert_eq!(find_segment_for_time(&table, 0), Some(0));

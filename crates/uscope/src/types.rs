@@ -1,6 +1,5 @@
 /// Wire-format types for the µScope trace format.
 /// All multi-byte integers are little-endian.
-
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{self, Read, Write};
 
@@ -10,7 +9,7 @@ pub const MAGIC: [u8; 4] = [0x75, 0x53, 0x43, 0x50]; // "uSCP"
 pub const SEG_MAGIC: [u8; 4] = [0x75, 0x53, 0x45, 0x47]; // "uSEG"
 
 pub const VERSION_MAJOR: u16 = 0;
-pub const VERSION_MINOR: u16 = 1;
+pub const VERSION_MINOR: u16 = 2;
 
 // ── File header flags ──────────────────────────────────────────────
 
@@ -23,6 +22,13 @@ pub const F_COMP_METHOD_MASK: u64 = 0b111 << F_COMP_METHOD_SHIFT;
 pub const COMP_LZ4: u64 = 0;
 pub const COMP_ZSTD: u64 = 1;
 pub const F_COMPACT_DELTAS: u64 = 1 << 6;
+pub const F_INTERLEAVED_DELTAS: u64 = 1 << 7;
+
+// ── Item tags (v0.2 interleaved format) ──────────────────────────
+
+pub const TAG_WIDE_OP: u8 = 0x01;
+pub const TAG_COMPACT_OP: u8 = 0x02;
+pub const TAG_EVENT: u8 = 0x03;
 
 // ── Storage flags ──────────────────────────────────────────────────
 
@@ -118,7 +124,7 @@ impl FileHeader {
             magic: MAGIC,
             version_major: VERSION_MAJOR,
             version_minor: VERSION_MINOR,
-            flags: F_COMPRESSED | F_COMPACT_DELTAS, // LZ4 + compact deltas by default
+            flags: F_COMPRESSED | F_INTERLEAVED_DELTAS, // LZ4 + interleaved v0.2 by default
             total_time_ps: 0,
             num_segments: 0,
             preamble_end: 0,
@@ -345,9 +351,9 @@ impl ClockDomainDef {
 pub struct ScopeDef {
     pub name: u16,
     pub scope_id: u16,
-    pub parent_id: u16,  // 0xFFFF = root
-    pub protocol: u16,   // string pool offset, 0xFFFF = no protocol
-    pub clock_id: u8,    // 0xFF = inherit
+    pub parent_id: u16, // 0xFFFF = root
+    pub protocol: u16,  // string pool offset, 0xFFFF = no protocol
+    pub clock_id: u8,   // 0xFF = inherit
     pub reserved: [u8; 3],
 }
 
@@ -452,9 +458,9 @@ impl EnumDef {
 
 #[derive(Debug, Clone)]
 pub struct FieldDef {
-    pub name: u16,    // string pool offset
+    pub name: u16, // string pool offset
     pub field_type: u8,
-    pub enum_id: u8,  // if type==FT_ENUM, else 0
+    pub enum_id: u8, // if type==FT_ENUM, else 0
     pub reserved: [u8; 4],
 }
 
@@ -1112,7 +1118,10 @@ mod tests {
         assert_eq!(wide.value, 42);
 
         // Cannot compact large storage_id or value
-        let big = DeltaOp { storage_id: 300, ..op };
+        let big = DeltaOp {
+            storage_id: 300,
+            ..op
+        };
         assert!(big.to_compact().is_none());
 
         let big_val = DeltaOp { value: 70000, ..op };

@@ -163,8 +163,9 @@ DUT descriptor, schema, and trace configuration.
 | 1    | `F_COMPRESSED`  | Delta segments use compression     |
 | 2    | `F_HAS_STRINGS` | String table section present       |
 | 3-5  | `F_COMP_METHOD` | Compression method (0=LZ4, 1=ZSTD; 2–7 reserved, must not be used). LZ4 support is mandatory for all readers; ZSTD is optional. |
-| 6    | `F_COMPACT_DELTAS` | Delta blobs may contain compact ops (§8.6.3) |
-| 7-63 | Reserved        | Must be zero                       |
+| 6    | `F_COMPACT_DELTAS` | Delta blobs may contain compact ops (§8.6.3). Ignored when `F_INTERLEAVED_DELTAS` is set. |
+| 7    | `F_INTERLEAVED_DELTAS` | v0.2 interleaved frame format (§8.6.6). Ops and events use self-describing tags. |
+| 8-63 | Reserved        | Must be zero                       |
 
 ### 2.2 Header Lifecycle
 
@@ -789,7 +790,42 @@ field sizes as derived from their types (see §4.3).
 Checkpoint blocks (§8.5) and cycle frames within the delta blob are also
 tightly packed with no inter-block or intra-block padding.
 
-#### 8.6.6 Compression
+#### 8.6.6 Interleaved Frame Format (v0.2)
+
+When the file header flag `F_INTERLEAVED_DELTAS` is set, cycle frames
+use a self-describing tagged item stream instead of separate op/event
+arrays. This preserves the exact call order of ops and events within a
+cycle, which the v0.1 format cannot represent.
+
+```
+cycle_frame_v2:
+  [LEB128]   time_delta_ps   1–10 bytes, unsigned delta in ps
+  [uint16]   num_items       total number of tagged items
+  [repeated] items           × num_items (self-describing via tag byte)
+```
+
+Each item starts with a tag byte that determines its type and size:
+
+| Tag    | Type       | Total size | Layout |
+| ------ | ---------- | ---------- | ------ |
+| `0x01` | Wide op    | 16 bytes   | `tag:u8 action:u8 storage_id:u16 slot:u16 field:u16 value:u64` |
+| `0x02` | Compact op |  8 bytes   | `tag:u8 action:u8 storage_id_lo:u8 slot:u16 field:u16 value16:u16` |
+| `0x03` | Event      | 8+N bytes  | `tag:u8 reserved:u8 event_type_id:u16 payload_size:u32 payload[N]` |
+
+The tag byte is **size-neutral**: it replaces the `reserved` byte in
+wide ops and one byte of the `reserved:u16` in events. The frame header
+shrinks by 3 bytes compared to v0.1 (no `op_format`, no separate counts).
+
+**Compact decision** is per-frame, same logic as v0.1: if all ops in
+the frame satisfy `storage_id ≤ 255` and `value ≤ 65535`, all ops use
+tag `0x02`; otherwise all ops use tag `0x01`. Events always use `0x03`.
+
+When `F_INTERLEAVED_DELTAS` is set, `F_COMPACT_DELTAS` is ignored.
+
+Readers must support both v0.1 (§8.6.1) and v0.2 frame formats by
+checking the `F_INTERLEAVED_DELTAS` flag.
+
+#### 8.6.7 Compression
 
 Per-segment, single LZ4 or ZSTD block. Method indicated in file header
 flags. Readers must reject files with unknown `F_COMP_METHOD` values.
@@ -1065,6 +1101,12 @@ algorithm (§9 of that document).
 |         |            | — `total_cycles` → `total_time_ps`                        |
 |         |            | — `cycle_start`/`cycle_end` → `time_start_ps`/`time_end_ps` |
 |         |            | — `checkpoint_interval` → `checkpoint_interval_ps`        |
+| 4.3     | 2026-03-21 | Interleaved frame format (v0.2):                          |
+|         |            | — `F_INTERLEAVED_DELTAS` flag (bit 7)                     |
+|         |            | — Tagged item stream replaces separate op/event arrays    |
+|         |            | — Preserves call order of ops and events within a cycle   |
+|         |            | — `version_minor` bumped to 2                             |
+|         |            | — `F_COMPACT_DELTAS` ignored when interleaved is set      |
 
 ---
 
@@ -1075,7 +1117,7 @@ algorithm (§9 of that document).
 | **Checkpoint**      | Full snapshot of all storage state at a segment boundary. Enables random access without replaying from the start. |
 | **Chunk**           | A typed, length-prefixed block in the preamble. Unknown chunk types are skipped for forward compatibility.        |
 | **Clock domain**    | A named clock with a period in picoseconds. Scopes are assigned to clock domains for cycle-number display.        |
-| **Cycle frame**     | One timestamp's worth of delta operations and events, prefixed by a LEB128 time delta in picoseconds.             |
+| **Cycle frame**     | One timestamp's worth of delta operations and events. v0.1: separate op/event arrays (§8.6.1). v0.2: interleaved tagged items preserving call order (§8.6.6). |
 | **Delta**           | A single state change within a cycle frame (`DA_SLOT_SET`, `DA_SLOT_CLEAR`, or `DA_SLOT_ADD`).                    |
 | **DUT**             | Device Under Test. The hardware being traced.                                                                     |
 | **Event**           | A timestamped occurrence with a schema-defined typed payload. Fire-and-forget (no persistent state).              |

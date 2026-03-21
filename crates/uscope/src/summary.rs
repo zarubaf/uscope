@@ -1,6 +1,5 @@
 /// Summary (mipmap pyramid) section read/write.
 /// Summary data is written at finalization for fast multi-resolution rendering.
-
 use crate::types::*;
 use std::io::{self, Read, Write};
 

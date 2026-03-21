@@ -1,6 +1,5 @@
 /// Streaming writer for µScope trace files.
 /// Writes file header, preamble, and segments incrementally.
-
 use crate::checkpoint::{FieldOffsets, StorageState};
 use crate::leb128;
 use crate::schema::Schema;
@@ -8,18 +7,30 @@ use crate::types::*;
 use byteorder::WriteBytesExt;
 use std::io::{self, Seek, SeekFrom, Write};
 
-/// Accumulated delta ops and events for the current cycle.
+/// A single item in an interleaved frame.
+#[derive(Debug, Clone)]
+enum FrameItem {
+    Op(DeltaOp),
+    Event(EventRecord),
+}
+
+/// Accumulated items for the current cycle (v0.2 interleaved).
 #[derive(Debug, Default)]
 struct CycleFrame {
-    ops: Vec<DeltaOp>,
-    events: Vec<EventRecord>,
+    items: Vec<FrameItem>,
 }
 
 impl CycleFrame {
     fn is_empty(&self) -> bool {
-        self.ops.is_empty() && self.events.is_empty()
+        self.items.is_empty()
     }
 
+    fn ops(&self) -> impl Iterator<Item = &DeltaOp> {
+        self.items.iter().filter_map(|item| match item {
+            FrameItem::Op(op) => Some(op),
+            _ => None,
+        })
+    }
 }
 
 /// A buffered segment waiting to be flushed.
@@ -195,7 +206,10 @@ impl<W: Write + Seek> Writer<W> {
 
     /// Begin a new cycle at the given time.
     pub fn begin_cycle(&mut self, time_ps: u64) {
-        assert!(!self.in_cycle, "begin_cycle called while already in a cycle");
+        assert!(
+            !self.in_cycle,
+            "begin_cycle called while already in a cycle"
+        );
         assert!(
             time_ps >= self.current_time_ps,
             "time must be monotonically increasing"
@@ -207,15 +221,14 @@ impl<W: Write + Seek> Writer<W> {
     /// Set a field value in a storage slot.
     pub fn slot_set(&mut self, storage_id: u16, slot: u16, field: u16, value: u64) {
         assert!(self.in_cycle, "slot_set called outside a cycle");
-        self.current_frame.ops.push(DeltaOp {
+        self.current_frame.items.push(FrameItem::Op(DeltaOp {
             action: DA_SLOT_SET,
             reserved: 0,
             storage_id,
             slot_index: slot,
             field_index: field,
             value,
-        });
-        // Update internal state
+        }));
         let sid = storage_id as usize;
         if sid < self.storage_states.len() {
             self.storage_states[sid].set_field_at(slot, &self.field_offsets[sid], field, value);
@@ -225,14 +238,14 @@ impl<W: Write + Seek> Writer<W> {
     /// Clear a slot in a storage.
     pub fn slot_clear(&mut self, storage_id: u16, slot: u16) {
         assert!(self.in_cycle, "slot_clear called outside a cycle");
-        self.current_frame.ops.push(DeltaOp {
+        self.current_frame.items.push(FrameItem::Op(DeltaOp {
             action: DA_SLOT_CLEAR,
             reserved: 0,
             storage_id,
             slot_index: slot,
             field_index: 0,
             value: 0,
-        });
+        }));
         let sid = storage_id as usize;
         if sid < self.storage_states.len() {
             self.storage_states[sid].clear_slot(slot);
@@ -242,14 +255,14 @@ impl<W: Write + Seek> Writer<W> {
     /// Add a value to a field in a storage slot.
     pub fn slot_add(&mut self, storage_id: u16, slot: u16, field: u16, value: u64) {
         assert!(self.in_cycle, "slot_add called outside a cycle");
-        self.current_frame.ops.push(DeltaOp {
+        self.current_frame.items.push(FrameItem::Op(DeltaOp {
             action: DA_SLOT_ADD,
             reserved: 0,
             storage_id,
             slot_index: slot,
             field_index: field,
             value,
-        });
+        }));
         let sid = storage_id as usize;
         if sid < self.storage_states.len() {
             self.storage_states[sid].add_field_at(slot, &self.field_offsets[sid], field, value);
@@ -259,12 +272,12 @@ impl<W: Write + Seek> Writer<W> {
     /// Emit an event with a pre-serialized payload.
     pub fn event(&mut self, event_type_id: u16, payload: &[u8]) {
         assert!(self.in_cycle, "event called outside a cycle");
-        self.current_frame.events.push(EventRecord {
+        self.current_frame.items.push(FrameItem::Event(EventRecord {
             event_type_id,
             reserved: 0,
             payload_size: payload.len() as u32,
             payload: payload.to_vec(),
-        });
+        }));
     }
 
     /// End the current cycle.
@@ -318,37 +331,44 @@ impl<W: Write + Seek> Writer<W> {
                 num_frames_active += 1;
             }
 
-            // Decide op format: try compact first
-            let use_compact = self.header.flags & F_COMPACT_DELTAS != 0
-                && frame.ops.iter().all(|op| op.to_compact().is_some());
-            let op_format: u8 = if use_compact { 1 } else { 0 };
+            // v0.2 interleaved format
+            // Decide compact vs wide: check if all ops fit compact
+            let use_compact = frame.ops().all(|op| op.to_compact().is_some());
 
             // time_delta_ps (LEB128)
             leb128::encode_u64_vec(*time_delta, &mut delta_raw);
-            // op_format
-            delta_raw.push(op_format);
-            // reserved
-            delta_raw.push(0);
-            // num_ops
-            delta_raw.extend_from_slice(&(frame.ops.len() as u16).to_le_bytes());
-            // num_events
-            delta_raw.extend_from_slice(&(frame.events.len() as u16).to_le_bytes());
+            // num_items
+            delta_raw.extend_from_slice(&(frame.items.len() as u16).to_le_bytes());
 
-            // ops
-            if use_compact {
-                for op in &frame.ops {
-                    let compact = op.to_compact().unwrap();
-                    compact.write_to(&mut delta_raw)?;
+            // Items in insertion order
+            for item in &frame.items {
+                match item {
+                    FrameItem::Op(op) => {
+                        if use_compact {
+                            let compact = op.to_compact().unwrap();
+                            delta_raw.push(TAG_COMPACT_OP);
+                            delta_raw.push(compact.action);
+                            delta_raw.push(compact.storage_id_lo);
+                            delta_raw.extend_from_slice(&compact.slot_index.to_le_bytes());
+                            delta_raw.extend_from_slice(&compact.field_index.to_le_bytes());
+                            delta_raw.extend_from_slice(&compact.value16.to_le_bytes());
+                        } else {
+                            delta_raw.push(TAG_WIDE_OP);
+                            delta_raw.push(op.action);
+                            delta_raw.extend_from_slice(&op.storage_id.to_le_bytes());
+                            delta_raw.extend_from_slice(&op.slot_index.to_le_bytes());
+                            delta_raw.extend_from_slice(&op.field_index.to_le_bytes());
+                            delta_raw.extend_from_slice(&op.value.to_le_bytes());
+                        }
+                    }
+                    FrameItem::Event(ev) => {
+                        delta_raw.push(TAG_EVENT);
+                        delta_raw.push(0); // reserved
+                        delta_raw.extend_from_slice(&ev.event_type_id.to_le_bytes());
+                        delta_raw.extend_from_slice(&ev.payload_size.to_le_bytes());
+                        delta_raw.extend_from_slice(&ev.payload);
+                    }
                 }
-            } else {
-                for op in &frame.ops {
-                    op.write_to(&mut delta_raw)?;
-                }
-            }
-
-            // events
-            for ev in &frame.events {
-                ev.write_to(&mut delta_raw)?;
             }
         }
 
@@ -489,8 +509,10 @@ mod tests {
         sb.scope("root", None, None, None);
         sb.scope("core0", Some(0), Some("cpu"), Some(0));
 
-        let stage_enum =
-            sb.enum_type("pipeline_stage", &["fetch", "decode", "execute", "writeback"]);
+        let stage_enum = sb.enum_type(
+            "pipeline_stage",
+            &["fetch", "decode", "execute", "writeback"],
+        );
 
         sb.storage(
             "entities",
@@ -579,5 +601,57 @@ mod tests {
         assert!(header.flags & F_COMPLETE != 0);
         assert_eq!(header.total_time_ps, 4000);
         assert!(header.num_segments >= 1);
+    }
+
+    #[test]
+    fn interleaved_order_preserved() {
+        // Verify that event(flush) then slot_clear() in the same cycle
+        // is read back in that exact order (the v0.2 guarantee).
+        let (dut, schema) = make_test_schema_and_dut();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("order.uscope");
+        let file = std::fs::File::create(&path).unwrap();
+        let mut w = Writer::create(file, &dut, &schema, 100_000).unwrap();
+
+        // Cycle 1: set up an entity in slot 0
+        w.begin_cycle(1000);
+        w.slot_set(0, 0, 0, 42); // entity_id = 42
+        w.slot_set(0, 0, 1, 0x8000_0000); // pc
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&42u32.to_le_bytes());
+        payload.push(0); // stage = fetch
+        w.event(0, &payload);
+        w.end_cycle().unwrap();
+
+        // Cycle 2: event(flush) THEN slot_clear — this is the critical order
+        w.begin_cycle(2000);
+        let mut flush_payload = Vec::new();
+        flush_payload.extend_from_slice(&42u32.to_le_bytes());
+        w.event(0, &flush_payload); // flush event first
+        w.slot_clear(0, 0); // then clear
+        w.end_cycle().unwrap();
+
+        let file = w.close().unwrap();
+        drop(file);
+
+        // Read back
+        let mut reader = crate::reader::Reader::open(path.to_str().unwrap()).unwrap();
+        let (_storages, items) = reader.segment_replay(0).unwrap();
+
+        // Find items at time 2000
+        let cycle2_items: Vec<_> = items.iter().filter(|i| i.time_ps() == 2000).collect();
+
+        assert_eq!(cycle2_items.len(), 2, "should have 2 items at t=2000");
+
+        // First item should be the event (flush), second should be the op (clear)
+        assert!(
+            matches!(cycle2_items[0], crate::state::TimedItem::Event(_)),
+            "first item at t=2000 should be event (flush)"
+        );
+        assert!(
+            matches!(cycle2_items[1], crate::state::TimedItem::Op(ref op) if op.action == DA_SLOT_CLEAR),
+            "second item at t=2000 should be op (slot_clear)"
+        );
     }
 }

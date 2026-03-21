@@ -1,6 +1,5 @@
 /// Checkpoint serialization and deserialization.
 /// A checkpoint captures the full state of all storages at a point in time.
-
 use crate::types::*;
 // byteorder used for CheckpointBlock read/write (via types.rs)
 use std::io::{self, Read, Write};
@@ -77,9 +76,7 @@ impl StorageState {
         let data = &self.data[base..];
         match field_type {
             FieldType::U8 | FieldType::I8 | FieldType::Bool | FieldType::Enum => data[0] as u64,
-            FieldType::U16 | FieldType::I16 => {
-                u16::from_le_bytes([data[0], data[1]]) as u64
-            }
+            FieldType::U16 | FieldType::I16 => u16::from_le_bytes([data[0], data[1]]) as u64,
             FieldType::U32 | FieldType::I32 | FieldType::StringRef => {
                 u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as u64
             }
@@ -243,7 +240,13 @@ impl FieldOffsets {
 /// Extended StorageState that uses precomputed field offsets.
 impl StorageState {
     /// Set a field using precomputed offsets.
-    pub fn set_field_at(&mut self, slot: u16, offsets: &FieldOffsets, field_index: u16, value: u64) {
+    pub fn set_field_at(
+        &mut self,
+        slot: u16,
+        offsets: &FieldOffsets,
+        field_index: u16,
+        value: u64,
+    ) {
         let slot_idx = slot as usize;
         if slot_idx >= self.num_slots as usize {
             return;
@@ -270,7 +273,13 @@ impl StorageState {
     }
 
     /// Add a value using precomputed offsets.
-    pub fn add_field_at(&mut self, slot: u16, offsets: &FieldOffsets, field_index: u16, value: u64) {
+    pub fn add_field_at(
+        &mut self,
+        slot: u16,
+        offsets: &FieldOffsets,
+        field_index: u16,
+        value: u64,
+    ) {
         let current = self.get_field_at(slot, offsets, field_index);
         self.set_field_at(slot, offsets, field_index, current.wrapping_add(value));
     }
@@ -287,9 +296,7 @@ impl StorageState {
         let data = &self.data[base..];
         match ft {
             FieldType::U8 | FieldType::I8 | FieldType::Bool | FieldType::Enum => data[0] as u64,
-            FieldType::U16 | FieldType::I16 => {
-                u16::from_le_bytes([data[0], data[1]]) as u64
-            }
+            FieldType::U16 | FieldType::I16 => u16::from_le_bytes([data[0], data[1]]) as u64,
             FieldType::U32 | FieldType::I32 | FieldType::StringRef => {
                 u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as u64
             }

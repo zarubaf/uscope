@@ -1,6 +1,5 @@
 /// State reconstruction: load checkpoint, replay deltas to reconstruct
 /// storage state at any point in time.
-
 use crate::checkpoint::{FieldOffsets, StorageState};
 use crate::leb128;
 use crate::types::*;
@@ -59,8 +58,27 @@ pub struct TimedOp {
     pub value: u64,
 }
 
+/// An ordered item from the v0.2 interleaved format.
+#[derive(Debug, Clone)]
+pub enum TimedItem {
+    Op(TimedOp),
+    Event(TimedEvent),
+}
+
+impl TimedItem {
+    pub fn time_ps(&self) -> u64 {
+        match self {
+            TimedItem::Op(op) => op.time_ps,
+            TimedItem::Event(ev) => ev.time_ps,
+        }
+    }
+}
+
 /// Replay delta blob, starting from checkpoint state, up to a target time.
 /// Returns the final state and all events encountered.
+///
+/// For v0.1 format (compact_deltas flag selects compact vs wide ops).
+/// For v0.2 interleaved format, use `replay_deltas_v2`.
 pub fn replay_deltas(
     delta_data: &[u8],
     storages: &mut Vec<StorageState>,
@@ -112,29 +130,15 @@ pub fn replay_deltas(
                     field_index: op.field_index,
                     value: op.value,
                 });
-
-                match op.action {
-                    DA_SLOT_SET => {
-                        storages[sid].set_field_at(
-                            op.slot_index,
-                            &field_offsets[sid],
-                            op.field_index,
-                            op.value,
-                        );
-                    }
-                    DA_SLOT_CLEAR => {
-                        storages[sid].clear_slot(op.slot_index);
-                    }
-                    DA_SLOT_ADD => {
-                        storages[sid].add_field_at(
-                            op.slot_index,
-                            &field_offsets[sid],
-                            op.field_index,
-                            op.value,
-                        );
-                    }
-                    _ => {}
-                }
+                apply_op(
+                    storages,
+                    field_offsets,
+                    sid,
+                    op.slot_index,
+                    op.action,
+                    op.field_index,
+                    op.value,
+                );
             }
         }
 
@@ -150,6 +154,150 @@ pub fn replay_deltas(
     }
 
     Ok((time_ps, events, ops))
+}
+
+/// Replay delta blob in v0.2 interleaved format.
+/// Items are returned in their original insertion order.
+pub fn replay_deltas_v2(
+    delta_data: &[u8],
+    storages: &mut Vec<StorageState>,
+    field_offsets: &[FieldOffsets],
+    start_time_ps: u64,
+    target_time_ps: Option<u64>,
+) -> io::Result<(u64, Vec<TimedItem>)> {
+    let mut cursor = Cursor::new(delta_data);
+    let mut time_ps = start_time_ps;
+    let mut items = Vec::new();
+
+    while (cursor.position() as usize) < delta_data.len() {
+        // Read time_delta (LEB128)
+        let remaining = &delta_data[cursor.position() as usize..];
+        let (time_delta, consumed) = leb128::decode_u64(remaining)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        cursor.set_position(cursor.position() + consumed as u64);
+        time_ps += time_delta;
+
+        // If we've passed the target time, stop
+        if let Some(target) = target_time_ps {
+            if time_ps > target {
+                break;
+            }
+        }
+
+        let num_items = cursor.read_u16::<LittleEndian>()?;
+
+        for _ in 0..num_items {
+            let tag = cursor.read_u8()?;
+            match tag {
+                TAG_WIDE_OP => {
+                    // 15 more bytes: action:u8 storage_id:u16 slot:u16 field:u16 value:u64
+                    let action = cursor.read_u8()?;
+                    let storage_id = cursor.read_u16::<LittleEndian>()?;
+                    let slot_index = cursor.read_u16::<LittleEndian>()?;
+                    let field_index = cursor.read_u16::<LittleEndian>()?;
+                    let value = cursor.read_u64::<LittleEndian>()?;
+
+                    let sid = storage_id as usize;
+                    if sid < storages.len() {
+                        apply_op(
+                            storages,
+                            field_offsets,
+                            sid,
+                            slot_index,
+                            action,
+                            field_index,
+                            value,
+                        );
+                        items.push(TimedItem::Op(TimedOp {
+                            time_ps,
+                            storage_id,
+                            slot: slot_index,
+                            action,
+                            field_index,
+                            value,
+                        }));
+                    }
+                }
+                TAG_COMPACT_OP => {
+                    // 7 more bytes: action:u8 storage_id_lo:u8 slot:u16 field:u16 value16:u16
+                    let action = cursor.read_u8()?;
+                    let storage_id_lo = cursor.read_u8()?;
+                    let slot_index = cursor.read_u16::<LittleEndian>()?;
+                    let field_index = cursor.read_u16::<LittleEndian>()?;
+                    let value16 = cursor.read_u16::<LittleEndian>()?;
+
+                    let storage_id = storage_id_lo as u16;
+                    let value = value16 as u64;
+                    let sid = storage_id as usize;
+                    if sid < storages.len() {
+                        apply_op(
+                            storages,
+                            field_offsets,
+                            sid,
+                            slot_index,
+                            action,
+                            field_index,
+                            value,
+                        );
+                        items.push(TimedItem::Op(TimedOp {
+                            time_ps,
+                            storage_id,
+                            slot: slot_index,
+                            action,
+                            field_index,
+                            value,
+                        }));
+                    }
+                }
+                TAG_EVENT => {
+                    // 7+ more bytes: reserved:u8 event_type_id:u16 payload_size:u32 payload[N]
+                    let _reserved = cursor.read_u8()?;
+                    let event_type_id = cursor.read_u16::<LittleEndian>()?;
+                    let payload_size = cursor.read_u32::<LittleEndian>()?;
+                    let mut payload = vec![0u8; payload_size as usize];
+                    std::io::Read::read_exact(&mut cursor, &mut payload)?;
+
+                    items.push(TimedItem::Event(TimedEvent {
+                        time_ps,
+                        event_type_id,
+                        payload,
+                    }));
+                }
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("unknown item tag: 0x{:02x}", tag),
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok((time_ps, items))
+}
+
+/// Apply a delta op to storage state.
+fn apply_op(
+    storages: &mut [StorageState],
+    field_offsets: &[FieldOffsets],
+    sid: usize,
+    slot_index: u16,
+    action: u8,
+    field_index: u16,
+    value: u64,
+) {
+    match action {
+        DA_SLOT_SET => {
+            storages[sid].set_field_at(slot_index, &field_offsets[sid], field_index, value);
+        }
+        DA_SLOT_CLEAR => {
+            storages[sid].clear_slot(slot_index);
+        }
+        DA_SLOT_ADD => {
+            storages[sid].add_field_at(slot_index, &field_offsets[sid], field_index, value);
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]

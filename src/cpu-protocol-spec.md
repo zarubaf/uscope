@@ -144,6 +144,11 @@ The `entity_id` field is always equal to the slot index. It is stored
 explicitly so that buffer storages and events can reference it using a
 uniform `U32` field, independent of the transport's slot indexing.
 
+**Slot reuse:** After `DA_SLOT_CLEAR`, the slot may be reused for a new
+instruction. The new occupant is a logically distinct entity — the viewer
+treats each clear/set cycle as a new entity lifetime. The viewer must not
+carry state (stage, annotations, dependencies) across a clear boundary.
+
 ---
 
 ## 4. Buffers and Stages
@@ -207,15 +212,18 @@ events generically (name + fields in a tooltip).
 ### 5.1 `stage_transition`
 
 Explicit pipeline stage change for an entity. The DUT emits this event
-each time an instruction advances to a new pipeline stage.
+each time an instruction advances to a new pipeline stage. Superscalar
+cores emit multiple `stage_transition` events in the same cycle frame
+(e.g., a 4-wide machine retiring 4 instructions produces 4 events).
 
 | Field name   | Type                      | Description              |
 | ------------ | ------------------------- | ------------------------ |
 | `entity_id`  | `U32`                     | Entity that advanced     |
 | `stage`      | `ENUM(pipeline_stage)`    | Stage the entity entered |
 
-The `pipeline_stage` enum values must match the names declared in the
-`pipeline_stages` DUT property (§4.1). For example:
+The enum must be named `pipeline_stage` in the schema. Its values must
+match the names declared in the `pipeline_stages` DUT property (§4.1).
+For example:
 
 | Value | Name       |
 | ----- | ---------- |
@@ -232,8 +240,11 @@ The enum is DUT-defined — an in-order core might have just
 `fetch, decode, execute, memory, writeback`.
 
 The viewer maintains a `current_stage` per entity. A Gantt bar for a
-stage spans from the cycle the entity entered it until the cycle it
-entered the next stage (or was cleared/flushed).
+stage spans from the time the entity entered it until the time it
+entered the next stage (or was cleared/flushed). Multi-cycle stages
+(e.g., a long-latency divide in `execute`) require no special handling —
+the entity simply stays in its current stage until the next
+`stage_transition` event.
 
 ### 5.2 `annotate`
 
@@ -384,21 +395,23 @@ protocols in multi-protocol traces.
 
 ### 9.2 Gantt Chart Rendering
 
-For a cycle range `[C0, C1)`:
+For a time range `[T0, T1)` in picoseconds:
 
-1. Seek to segment covering `C0` (binary search or chain walk)
+1. Seek to segment covering `T0` (binary search or chain walk)
 2. Load checkpoint → initial state of all storages
-3. Replay deltas and events `C0..C1`, tracking per-entity:
+3. Replay deltas and events `T0..T1`, tracking per-entity:
    - **Birth**: entity slot becomes valid in `entities`
    - **Stage transitions**: `stage_transition` event → record
-     `(entity_id, stage, cycle)`
+     `(entity_id, stage, timestamp)`
    - **Death**: entity slot cleared in `entities` (retire or flush)
 4. For each entity, emit Gantt bars: each stage spans from its
-   `stage_transition` cycle until the next transition (or death)
+   `stage_transition` timestamp until the next transition (or death)
 5. Entity labels: read `pc` and `inst_bits` from entity catalog,
    decode via ISA disassembler
 6. Dependency arrows: `dependency` events in the range
 7. Flush markers: `flush` events in the range
+8. Convert timestamps to domain-local cycle numbers for display
+   using the scope's clock domain period
 
 ### 9.3 Occupancy View
 

@@ -1,6 +1,6 @@
 # µScope Trace Format Specification
 
-**Version:** 4.0-draft
+**Version:** 4.1-draft
 **Magic:** `uSCP` (0x75 0x53 0x43 0x50)
 **Byte order:** Little-endian (all multi-byte integers throughout the file,
 including field values in event payloads, checkpoint slot data, and summary
@@ -52,7 +52,8 @@ stored at the end of the schema chunk payload. Both the DUT descriptor and
 schema definitions reference it.
 
 The optional string table section (§7) stores runtime strings referenced by
-`FT_STRING_REF` fields in delta data.
+`FT_STRING_REF` fields in delta data. An `FT_STRING_REF` value is a 0-based
+index into the string table's entries array.
 
 ### 1.4 File Layout
 
@@ -112,6 +113,24 @@ data is written and the file header is rewritten with final values.
 
 See §8 for details.
 
+### 1.6 Time Model
+
+All timestamps in µScope are in **picoseconds** (ps). This provides a
+universal time axis that accommodates multiple clock domains without
+conversion loss — every practical hardware clock period is an integer
+number of picoseconds (e.g., 5 GHz → 200 ps, 800 MHz → 1250 ps).
+
+Cycle-frame deltas, segment boundaries, and summary buckets all use
+picosecond timestamps. The schema defines **clock domains** (§4.9),
+each with a name and period. Scopes are assigned to clock domains so
+the viewer can display domain-local cycle numbers (by dividing
+timestamps by the clock period).
+
+Writers emit cycle-frame deltas equal to the clock period of the active
+domain (e.g., 200 for a 5 GHz clock). LEB128 encoding keeps this
+compact (1–2 bytes), and segment-level compression handles the
+repeating patterns efficiently.
+
 ---
 
 ## 2. File Header
@@ -122,9 +141,9 @@ Offset 0. Fixed size: **48 bytes.**
 typedef struct {
     uint8_t  magic[4];              // "uSCP" = {0x75, 0x53, 0x43, 0x50}
     uint16_t version_major;         // 4
-    uint16_t version_minor;         // 0
+    uint16_t version_minor;         // 1
     uint64_t flags;                 // §2.1
-    uint64_t total_cycles;          // 0 until finalized
+    uint64_t total_time_ps;         // total trace duration in picoseconds (0 until finalized)
     uint32_t num_segments;          // updated after each segment flush
     uint32_t preamble_end;          // file offset where segments begin
     uint64_t section_table_offset;  // 0 until finalized
@@ -143,7 +162,7 @@ DUT descriptor, schema, and trace configuration.
 | 0    | `F_COMPLETE`    | Trace was cleanly finalized        |
 | 1    | `F_COMPRESSED`  | Delta segments use compression     |
 | 2    | `F_HAS_STRINGS` | String table section present       |
-| 3-5  | `F_COMP_METHOD` | Compression method (0=LZ4, 1=ZSTD; 2–7 reserved, must not be used) |
+| 3-5  | `F_COMP_METHOD` | Compression method (0=LZ4, 1=ZSTD; 2–7 reserved, must not be used). LZ4 support is mandatory for all readers; ZSTD is optional. |
 | 6    | `F_COMPACT_DELTAS` | Delta blobs may contain compact ops (§8.6.3) |
 | 7-63 | Reserved        | Must be zero                       |
 
@@ -153,7 +172,7 @@ DUT descriptor, schema, and trace configuration.
 | ---------------------- | ------------------ | --------------------- | ---------------------- |
 | `magic`                | `uSCP`             | —                     | —                      |
 | `flags`                | `F_COMPRESSED` etc | —                     | `F_COMPLETE` set       |
-| `total_cycles`         | 0                  | —                     | final value            |
+| `total_time_ps`        | 0                  | —                     | final value            |
 | `num_segments`         | 0                  | incremented           | final value            |
 | `preamble_end`         | final value        | —                     | —                      |
 | `section_table_offset` | 0                  | —                     | final offset           |
@@ -163,8 +182,8 @@ After fully writing a segment, the writer commits it in this order:
 
 1. Write segment data (header + checkpoint + deltas) at EOF
 2. Memory barrier / `fsync`
-3. Write `tail_offset` (single 8-byte aligned write — the **commit point**)
-4. Write `num_segments` (single 8-byte aligned write — advisory)
+3. Write `tail_offset` (single naturally-aligned 8-byte write — the **commit point**)
+4. Write `num_segments` (single naturally-aligned 4-byte write — advisory)
 
 A live reader uses `tail_offset` as the sole authoritative indicator of
 new data. `num_segments` may lag by one during live reads.
@@ -214,9 +233,8 @@ Session-level parameters that govern how the trace was captured.
 
 ```c
 typedef struct {
-    uint32_t checkpoint_interval;   // cycles between checkpoints
-    uint32_t reserved;              // must be 0
-} trace_config_t;                   // 8 bytes (CHUNK_TRACE_CONFIG payload)
+    uint64_t checkpoint_interval_ps; // picoseconds between checkpoints
+} trace_config_t;                    // 8 bytes (CHUNK_TRACE_CONFIG payload)
 ```
 
 ---
@@ -246,16 +264,17 @@ Properties are opaque key-value pairs. The transport layer does not interpret
 them — only the protocol layer does. Protocol version, vendor, DUT name, and
 any domain-specific metadata are all properties.
 
-Example properties for an OoO CPU:
+Example properties for an OoO CPU (protocol-specific keys use a prefix
+to avoid collisions in multi-protocol traces):
 
-| Key                | Value             |
-| ------------------ | ----------------- |
-| `dut_name`         | `boom_core_0`     |
-| `vendor`           | `acme`            |
-| `protocol_version` | `1.0.0`           |
-| `isa`              | `RV64IMAFDCV`     |
-| `pipeline_depth`   | `12`              |
-| `elf_path`         | `/path/to/fw.elf` |
+| Key                      | Value             |
+| ------------------------ | ----------------- |
+| `dut_name`               | `boom_core_0`     |
+| `cpu.vendor`             | `acme`            |
+| `cpu.protocol_version`   | `1.0.0`           |
+| `cpu.isa`                | `RV64IMAFDCV`     |
+| `cpu.pipeline_depth`     | `12`              |
+| `cpu.elf_path`           | `/path/to/fw.elf` |
 
 ---
 
@@ -271,13 +290,14 @@ plugin.
 ```c
 typedef struct {
     uint8_t  num_enums;             // max 255 enum types
-    uint8_t  reserved0;
+    uint8_t  num_clock_domains;     // max 255 clock domains
     uint16_t num_scopes;
     uint16_t num_storages;
     uint16_t num_event_types;
     uint16_t num_summary_fields;
     uint16_t string_pool_offset;    // offset from schema start to string pool
     // Followed by, in order:
+    //   clock_domain_def_t      clocks[num_clock_domains]
     //   scope_def_t             scopes[num_scopes]
     //   enum_def_t              enums[num_enums]              (variable-size)
     //   storage_def_t           storages[num_storages]        (variable-size)
@@ -300,7 +320,7 @@ enum field_type : uint8_t {
     FT_I32          = 0x07,
     FT_I64          = 0x08,
     FT_BOOL         = 0x09,         // 1 byte
-    FT_STRING_REF   = 0x0A,         // uint32_t offset into string table section
+    FT_STRING_REF   = 0x0A,         // uint32_t index into string table entries[]
     FT_ENUM         = 0x0B,         // uint8_t index into a named enum
 };
 ```
@@ -337,7 +357,9 @@ typedef struct {
     uint16_t scope_id;          // 0-based; scope 0 = root
     uint16_t parent_id;         // parent scope_id, 0xFFFF = root (only valid for scope 0)
     uint16_t protocol;          // offset into string pool, 0xFFFF = no protocol
-} scope_def_t;                  // 8 bytes
+    uint8_t  clock_id;          // clock domain index (§4.9), 0xFF = inherit from parent
+    uint8_t  reserved[3];
+} scope_def_t;                  // 12 bytes
 ```
 
 Each scope optionally declares a **protocol** — a string identifying
@@ -415,14 +437,47 @@ typedef struct {
 typedef struct {
     uint16_t name;                  // offset into string pool
     uint8_t  type;                  // field_type (size derived from type, see §4.3)
-    uint8_t  reserved[5];
+    uint8_t  reserved;
+    uint16_t scope_id;              // owning scope (same field as in storage/event defs)
+    uint16_t reserved2;
 } summary_field_def_t;              // 8 bytes
 ```
+
+Summary fields are scoped: in a multi-scope trace, each scope has its own
+set of summary fields. Fields with the same name in different scopes are
+independent (e.g., `core0/committed` vs. `core1/committed`).
 
 Summary fields are opaque to the transport. The writer computes and writes
 values; the transport stores and retrieves them. What each field means
 (counter rate, storage occupancy, event frequency) is the protocol layer's
 concern.
+
+### 4.9 Clock Domain Definition
+
+```c
+typedef struct {
+    uint16_t name;                  // offset into string pool (e.g., "core_clk")
+    uint16_t clock_id;              // 0-based
+    uint32_t period_ps;             // clock period in picoseconds (0 = unknown)
+} clock_domain_def_t;               // 8 bytes
+```
+
+Each clock domain defines a named clock with a period in picoseconds.
+Scopes reference clock domains via `clock_id` in `scope_def_t` (§4.4).
+
+The viewer uses `period_ps` to convert picosecond timestamps to
+domain-local cycle numbers for display (cycle = timestamp / period_ps).
+
+A trace must define at least one clock domain. If the DUT has a single
+clock, one domain suffices. Multi-clock SoCs define one domain per
+distinct clock frequency.
+
+| Example            | `period_ps` | Frequency |
+| ------------------ | ----------- | --------- |
+| `core_clk`         | 200         | 5.0 GHz   |
+| `bus_clk`          | 1000        | 1.0 GHz   |
+| `mem_clk`          | 1250        | 800 MHz   |
+| `slow_periph_clk`  | 30000       | 33.3 MHz  |
 
 ---
 
@@ -464,9 +519,10 @@ Written at finalization only.
 ```c
 typedef struct {
     uint32_t num_levels;
-    uint32_t base_interval;         // level 0 bucket size in cycles
     uint32_t fan_out;               // reduction factor per level
     uint32_t entry_size;            // computed from summary field defs
+    uint32_t reserved;
+    uint64_t base_interval_ps;      // level 0 bucket size in picoseconds
     // level_desc_t levels[num_levels];
 } summary_header_t;
 
@@ -484,7 +540,7 @@ Layout determined by `summary_field_def_t[]`:
 ```c
 // Pseudo-layout:
 typedef struct {
-    uint64_t cycle_start;
+    uint64_t time_start_ps;
     // For each summary_field_def:
     //   value at field's size bytes
 } summary_entry_t;
@@ -506,11 +562,14 @@ typedef struct {
 } string_table_header_t;
 
 typedef struct {
-    uint64_t key;
-    uint32_t offset;
-    uint32_t reserved;
-} string_index_t;                   // 16 bytes
+    uint32_t offset;                // byte offset into string data (relative to end of entries array)
+    uint32_t length;                // string length in bytes (excluding null terminator)
+} string_index_t;                   // 8 bytes
 ```
+
+An `FT_STRING_REF` field value is a 0-based index into the `entries[]`
+array. The reader looks up `entries[value]` to get the offset and length
+of the string data. Writers assign sequential indices starting from 0.
 
 ---
 
@@ -528,14 +587,14 @@ forming a backward chain.
 typedef struct {
     uint32_t segment_magic;         // "uSEG" = {0x75, 0x53, 0x45, 0x47}
     uint32_t flags;
-    uint64_t cycle_start;
-    uint64_t cycle_end;             // exclusive
+    uint64_t time_start_ps;         // segment start time in picoseconds
+    uint64_t time_end_ps;           // exclusive
     uint64_t prev_segment_offset;   // file offset of previous segment (0 = first)
     uint32_t checkpoint_size;
     uint32_t deltas_compressed_size;
     uint32_t deltas_raw_size;
-    uint32_t num_cycle_frames;      // number of cycle_frame records in decompressed delta blob
-    uint32_t num_cycles_active;
+    uint32_t num_frames;            // number of cycle_frame records in decompressed delta blob
+    uint32_t num_frames_active;     // frames with at least one op or event
     uint32_t reserved;
     // checkpoint data (checkpoint_size bytes)
     // compressed delta data (deltas_compressed_size bytes)
@@ -553,8 +612,8 @@ from `tail_offset` in the file header backward to the first segment
 
 ```mermaid
 flowchart LR
-  S2["Segment 2<br />[2000,3000)<br />prev→S1"] -->|prev| S1["Segment 1<br />[1000,2000)<br />prev→S0"]
-  S1 -->|prev| S0["Segment 0<br />[0,1000)<br />prev=0"]
+  S2["Segment 2<br />[400ns,600ns)<br />prev→S1"] -->|prev| S1["Segment 1<br />[200ns,400ns)<br />prev→S0"]
+  S1 -->|prev| S0["Segment 0<br />[0,200ns)<br />prev=0"]
   tail(["tail_offset"]) -.->|points to| S2
 ```
 
@@ -566,12 +625,12 @@ This table is referenced by `SECTION_SEGMENTS` in the section table.
 ```c
 typedef struct {
     uint64_t offset;                // file offset of segment_header_t
-    uint64_t cycle_start;
-    uint64_t cycle_end;             // exclusive
+    uint64_t time_start_ps;
+    uint64_t time_end_ps;           // exclusive
 } segment_index_entry_t;            // 24 bytes
 ```
 
-Binary search on `cycle_start` gives O(log n) seek to any cycle.
+Binary search on `time_start_ps` gives O(log n) seek to any timestamp.
 
 ### 8.4 Reading Strategies
 
@@ -579,7 +638,7 @@ Binary search on `cycle_start` gives O(log n) seek to any cycle.
 1. Read file header → `preamble_end`, `section_table_offset`
 2. Scan preamble chunks → extract DUT, schema, trace config
 3. Read section table → find `SECTION_SEGMENTS`
-4. Binary search segment table for target cycle → get segment offset
+4. Binary search segment table for target timestamp → get segment offset
 5. Read segment header + checkpoint + deltas at that offset
 
 **Live file** (`F_COMPLETE` not set):
@@ -634,7 +693,7 @@ Wire format (variable-length — not representable as a C struct):
 
 ```
 cycle_frame:
-  [LEB128]   cycle_delta     1–10 bytes, unsigned delta from previous frame
+  [LEB128]   time_delta_ps   1–10 bytes, unsigned delta in ps from previous frame
   [uint8]    op_format       0 = wide (16B delta_op_t), 1 = compact (8B delta_op_compact_t)
   [uint8]    reserved        must be 0
   [uint16]   num_ops
@@ -647,18 +706,19 @@ The `op_format` field is only meaningful when `F_COMPACT_DELTAS` is set
 in the file header. If the flag is not set, `op_format` must be 0 (wide)
 and readers may skip checking it.
 
-The cycle delta uses **unsigned LEB128** encoding (same as DWARF / protobuf):
+The time delta uses **unsigned LEB128** encoding (same as DWARF / protobuf).
+Values are in picoseconds. For a 5 GHz clock (200 ps period), consecutive
+cycles produce a repeating delta of 200:
 
-| Delta value | Encoded bytes | Typical scenario              |
-| ----------- | ------------- | ----------------------------- |
-| 0           | 1 (0x00)      | Multiple frames at same cycle |
-| 1           | 1 (0x01)      | Consecutive-cycle activity    |
-| 2–127       | 1             | Small gaps                    |
-| 128–16383   | 2             | Moderate gaps                 |
-| 16384+      | 3+            | Large idle gaps (rare)        |
+| Delta value | Encoded bytes | Typical scenario                     |
+| ----------- | ------------- | ------------------------------------ |
+| 0           | 1 (0x00)      | Multiple frames at same timestamp    |
+| 1–127       | 1             | Sub-ns deltas (rare)                 |
+| 128–16383   | 2             | Most clock periods (e.g., 200–1250)  |
+| 16384+      | 3+            | Large idle gaps                      |
 
-The first frame in each segment uses `segment_header_t.cycle_start` as the
-base, so each segment is independently decodable without prior context.
+The first frame in each segment uses `segment_header_t.time_start_ps` as
+the base, so each segment is independently decodable without prior context.
 
 #### 8.6.2 Delta Operations
 
@@ -695,8 +755,12 @@ typedef struct {
 } delta_op_compact_t;               // 8 bytes
 ```
 
-Compact ops are limited to `storage_id` 0–255. Writers must use wide ops
-for frames that reference storages with ID ≥ 256.
+Compact ops have the following limitations. If any op in a frame violates
+these, the writer must use wide format for the entire frame:
+
+- `storage_id` must be 0–255
+- `value16` is zero-extended to 64 bits; values > 65535 cannot be represented
+- `DA_SLOT_CLEAR` ignores `field_index` and `value16` (same as wide format)
 
 #### 8.6.4 Event Records
 
@@ -708,6 +772,11 @@ typedef struct {
     // uint8_t payload[payload_size];
 } event_record_t;
 ```
+
+The `payload_size` must equal the sum of field sizes for this event type
+as defined in the schema. Writers must not emit a different size. Readers
+should validate this but may use `payload_size` to skip events with
+unrecognized `event_type_id` without consulting the schema.
 
 #### 8.6.5 Payload Wire Format
 
@@ -738,7 +807,7 @@ uscope_writer_t* uscope_writer_open(const char* path,
 void             uscope_writer_close(uscope_writer_t* w);
 
 // ── Per-cycle ──
-void uscope_begin_cycle(uscope_writer_t* w, uint64_t cycle);
+void uscope_begin_cycle(uscope_writer_t* w, uint64_t time_ps);
 
 void uscope_slot_set(uscope_writer_t* w, uint16_t storage_id,
                       uint16_t slot, uint16_t field, uint64_t value);
@@ -771,7 +840,7 @@ are defined by each protocol, not by this spec.
 import "DPI-C" function chandle uscope_open(string path);
 import "DPI-C" function void    uscope_close(chandle w);
 
-import "DPI-C" function void    uscope_begin_cycle(chandle w, longint unsigned cycle);
+import "DPI-C" function void    uscope_begin_cycle(chandle w, longint unsigned time_ps);
 import "DPI-C" function void    uscope_end_cycle(chandle w);
 
 import "DPI-C" function void    uscope_slot_set(
@@ -805,7 +874,8 @@ void             uscope_reader_close(uscope_reader_t* r);
 const file_header_t*  uscope_header(const uscope_reader_t* r);
 const dut_desc_t*     uscope_dut_desc(const uscope_reader_t* r);
 const schema_t*       uscope_schema(const uscope_reader_t* r);
-const char*           uscope_protocol(const uscope_reader_t* r);
+const char*           uscope_scope_protocol(const uscope_reader_t* r,
+                                             uint16_t scope_id);
 const char*           uscope_dut_property(const uscope_reader_t* r,
                                            const char* key);
 bool                  uscope_is_complete(const uscope_reader_t* r);
@@ -816,7 +886,7 @@ const void* uscope_summary_data(const uscope_reader_t* r, uint32_t level,
                                  uint32_t* out_count);
 
 // ── State reconstruction ──
-uscope_state_t* uscope_state_at(uscope_reader_t* r, uint64_t cycle);
+uscope_state_t* uscope_state_at(uscope_reader_t* r, uint64_t time_ps);
 void            uscope_state_free(uscope_state_t* s);
 
 bool     uscope_slot_valid(const uscope_state_t* s, uint16_t storage_id,
@@ -828,9 +898,9 @@ uint32_t uscope_storage_occupancy(const uscope_state_t* s,
 
 // ── Events ──
 uscope_event_iter_t* uscope_events_in_range(uscope_reader_t* r,
-                                             uint64_t cycle_start,
-                                             uint64_t cycle_end);
-bool uscope_event_next(uscope_event_iter_t* it, uint64_t* cycle,
+                                             uint64_t time_start_ps,
+                                             uint64_t time_end_ps);
+bool uscope_event_next(uscope_event_iter_t* it, uint64_t* time_ps,
                         uint16_t* event_type_id, const void** payload);
 void uscope_event_iter_free(uscope_event_iter_t* it);
 
@@ -842,52 +912,23 @@ bool uscope_poll_new_segments(uscope_reader_t* r);
 
 ## 11. Konata Trace Reconstruction
 
-This section demonstrates that µScope carries all information needed to
-reconstruct a Konata-format pipeline visualization using only storages and
-events.
+This section demonstrates that µScope's two primitives (storages + events)
+carry all information needed to reconstruct a Konata-format pipeline
+visualization.
 
-### 11.1 Protocol-Level Modeling
+| Konata cmd        | µScope equivalent                                                    |
+| ----------------- | -------------------------------------------------------------------- |
+| `I` (create)      | `DA_SLOT_SET` on entity catalog slot                                 |
+| `L` (label)       | Entity catalog fields (`pc`, `inst_bits`) decoded by protocol plugin |
+| `S` (stage start) | `stage_transition` event                                             |
+| `E` (stage end)   | Next `stage_transition` or entity cleared/flushed                    |
+| `R` (retire)      | `DA_SLOT_CLEAR` on entity catalog slot                               |
+| `W` (flush)       | `flush` event with entity ID                                         |
+| `C` (cycle)       | Absolute timestamp (segment base + cumulative LEB128 deltas)         |
+| Dependency arrows | `dependency` events linking entity IDs                               |
 
-An `ooo_cpu` protocol models pipeline concepts using transport primitives:
-
-| Concept          | Transport model                                                                                |
-| ---------------- | ---------------------------------------------------------------------------------------------- |
-| Entity catalog   | A storage (e.g. `entities`) with one slot per entity. Fields: `pc`, `opcode`, etc.             |
-| Pipeline stages  | Storages representing structures (ROB, IQ, etc.). Slots contain entity IDs as `FT_U64` fields. |
-| Entity lifecycle | Entity ID appears via `DA_SLOT_SET`, disappears via `DA_SLOT_CLEAR`                            |
-| Annotations      | Events with entity ID as a field (e.g. `annotate_text` event type)                             |
-| Dependencies     | Events with `(source_id, target_id, dep_type)` fields                                          |
-| Flush/squash     | Events with `(entity_id, reason)` fields                                                       |
-| Counters         | 1-slot storages with a numeric field, mutated via `DA_SLOT_ADD`                                |
-
-### 11.2 Konata Command Mapping
-
-| Konata cmd        | µScope equivalent                                                 |
-| ----------------- | ----------------------------------------------------------------- |
-| `I` (create)      | `DA_SLOT_SET` writing an entity ID into a stage storage           |
-| `L` (label)       | Fields in the entity catalog storage (decoded by protocol plugin) |
-| `S` (stage start) | `DA_SLOT_SET` placing entity ID into a new storage (entity moves) |
-| `E` (stage end)   | Inferred: slot cleared or entity ID overwritten                   |
-| `R` (retire)      | `DA_SLOT_CLEAR` on last storage, or a retire event                |
-| `W` (flush)       | A flush event with entity ID                                      |
-| `C` (cycle)       | Decoded absolute cycle (segment base + cumulative LEB128 deltas)  |
-| Dependency arrows | Dependency events linking entity IDs                              |
-
-### 11.3 Reconstruction Algorithm
-
-To render a Konata-style Gantt chart for a range of entities:
-
-1. Load the segment(s) covering the cycle range of interest
-2. Replay deltas, tracking per-entity stage transitions:
-   - When an entity ID appears in a storage slot → record stage entry
-   - When the entity ID disappears (slot cleared or overwritten) → record stage exit
-3. For each entity, the sequence of `(stage, cycle_start, cycle_end)` tuples gives the Gantt bars
-4. Entity labels come from the entity catalog storage + protocol decoder
-5. Dependency arrows come from dependency events
-6. Flush/squash markers come from flush events
-
-This reconstruction happens in the **protocol plugin**, not in the transport
-layer.
+See the `cpu` protocol specification for the full reconstruction
+algorithm (§9 of that document).
 
 ---
 
@@ -1017,6 +1058,13 @@ layer.
 |         |            | — Live-read commit ordering specified                     |
 |         |            | — Scopes: hierarchical grouping of storages/events        |
 |         |            | — Per-scope protocol assignment (multi-protocol traces)   |
+| 4.2     | 2026-xx-xx | Picosecond time model:                                    |
+|         |            | — All timestamps in picoseconds (universal time axis)     |
+|         |            | — Clock domain definitions in schema (name + period)      |
+|         |            | — Scopes assigned to clock domains                        |
+|         |            | — `total_cycles` → `total_time_ps`                        |
+|         |            | — `cycle_start`/`cycle_end` → `time_start_ps`/`time_end_ps` |
+|         |            | — `checkpoint_interval` → `checkpoint_interval_ps`        |
 
 ---
 
@@ -1026,12 +1074,13 @@ layer.
 | ------------------- | ----------------------------------------------------------------------------------------------------------------- |
 | **Checkpoint**      | Full snapshot of all storage state at a segment boundary. Enables random access without replaying from the start. |
 | **Chunk**           | A typed, length-prefixed block in the preamble. Unknown chunk types are skipped for forward compatibility.        |
-| **Cycle frame**     | One cycle's worth of delta operations and events, prefixed by a LEB128 cycle delta.                               |
+| **Clock domain**    | A named clock with a period in picoseconds. Scopes are assigned to clock domains for cycle-number display.        |
+| **Cycle frame**     | One timestamp's worth of delta operations and events, prefixed by a LEB128 time delta in picoseconds.             |
 | **Delta**           | A single state change within a cycle frame (`DA_SLOT_SET`, `DA_SLOT_CLEAR`, or `DA_SLOT_ADD`).                    |
 | **DUT**             | Device Under Test. The hardware being traced.                                                                     |
 | **Event**           | A timestamped occurrence with a schema-defined typed payload. Fire-and-forget (no persistent state).              |
 | **Finalization**    | The process of writing summary, string table, segment table, and section table at trace close. Sets `F_COMPLETE`. |
-| **LEB128**          | Little-Endian Base 128. Variable-length unsigned integer encoding. Used for cycle deltas.                         |
+| **LEB128**          | Little-Endian Base 128. Variable-length unsigned integer encoding. Used for time deltas.                          |
 | **Mipmap**          | Multi-resolution summary pyramid. Each level aggregates the level below by a fan-out factor.                      |
 | **Preamble**        | The chunk stream between the file header and the first segment. Contains DUT, schema, and trace config.           |
 | **Protocol layer**  | Defines semantic meaning for a specific DUT type (e.g. `cpu`). Assigned per-scope. Not part of this spec.         |

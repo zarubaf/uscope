@@ -33,6 +33,7 @@ pub const TAG_EVENT: u8 = 0x03;
 // ── Storage flags ──────────────────────────────────────────────────
 
 pub const SF_SPARSE: u16 = 1 << 0;
+pub const SF_BUFFER: u16 = 1 << 1;
 
 // ── Preamble chunk types ───────────────────────────────────────────
 
@@ -506,6 +507,10 @@ impl StorageDef {
 
     pub fn is_sparse(&self) -> bool {
         self.flags & SF_SPARSE != 0
+    }
+
+    pub fn is_buffer(&self) -> bool {
+        self.flags & SF_BUFFER != 0
     }
 
     /// Size of one slot in bytes (sum of field sizes).

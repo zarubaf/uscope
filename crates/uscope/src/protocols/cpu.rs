@@ -5,6 +5,15 @@ use crate::types::*;
 use crate::writer::Writer;
 use std::io::{Seek, Write};
 
+/// Metadata for a buffer storage created by the CPU schema builder.
+#[derive(Debug, Clone)]
+pub struct BufferInfo {
+    pub name: String,
+    pub storage_id: u16,
+    pub entity_id_field: u16,
+    pub fields: Vec<(String, u16)>,
+}
+
 /// IDs assigned during schema construction.
 #[derive(Debug, Clone)]
 pub struct CpuIds {
@@ -24,7 +33,7 @@ pub struct CpuIds {
     pub field_pc: u16,
     pub field_inst_bits: u16,
     // Optional buffer/counter storage IDs
-    pub buffers: Vec<(String, u16)>,
+    pub buffers: Vec<BufferInfo>,
     pub counters: Vec<(String, u16, u16)>, // (name, storage_id, count_field_index)
 }
 
@@ -202,8 +211,20 @@ impl CpuSchemaBuilder {
             for (n, f) in &buf.extra_fields {
                 fields.push((n.as_str(), f.clone()));
             }
-            let sid = sb.storage(&buf.name, scope_id, buf.num_slots, SF_SPARSE, &fields);
-            buffer_ids.push((buf.name.clone(), sid));
+            let sid = sb.storage(&buf.name, scope_id, buf.num_slots, SF_BUFFER, &fields);
+            let entity_id_field = 0u16;
+            let extra: Vec<(String, u16)> = buf
+                .extra_fields
+                .iter()
+                .enumerate()
+                .map(|(i, (n, _))| (n.clone(), (i + 1) as u16))
+                .collect();
+            buffer_ids.push(BufferInfo {
+                name: buf.name.clone(),
+                storage_id: sid,
+                entity_id_field,
+                fields: extra,
+            });
         }
 
         // Counters (1-slot dense storages)
@@ -365,6 +386,54 @@ impl CpuWriter {
         for (name, sid, field) in &self.ids.counters {
             if name == counter_name {
                 w.slot_add(*sid, 0, *field, delta);
+                return;
+            }
+        }
+    }
+
+    /// Set a buffer slot to an entity.
+    pub fn buffer_set<W: Write + Seek>(
+        &self,
+        w: &mut Writer<W>,
+        name: &str,
+        slot: u16,
+        entity_id: u32,
+    ) {
+        for buf in &self.ids.buffers {
+            if buf.name == name {
+                w.slot_set(buf.storage_id, slot, buf.entity_id_field, entity_id as u64);
+                return;
+            }
+        }
+    }
+
+    /// Set an additional field on a buffer slot.
+    pub fn buffer_set_field<W: Write + Seek>(
+        &self,
+        w: &mut Writer<W>,
+        name: &str,
+        slot: u16,
+        field_name: &str,
+        value: u64,
+    ) {
+        for buf in &self.ids.buffers {
+            if buf.name == name {
+                for (fname, fidx) in &buf.fields {
+                    if fname == field_name {
+                        w.slot_set(buf.storage_id, slot, *fidx, value);
+                        return;
+                    }
+                }
+                return;
+            }
+        }
+    }
+
+    /// Clear a buffer slot.
+    pub fn buffer_clear<W: Write + Seek>(&self, w: &mut Writer<W>, name: &str, slot: u16) {
+        for buf in &self.ids.buffers {
+            if buf.name == name {
+                w.slot_clear(buf.storage_id, slot);
                 return;
             }
         }

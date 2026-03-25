@@ -2,5 +2,6 @@
 members = [
     "crates/uscope",
     "crates/konata2uscope",
+    "crates/gen-uscope",
 ]
 resolver = "2"

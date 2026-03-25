@@ -1,0 +1,10 @@
+[package]
+name = "gen-uscope"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Generate synthetic µScope CPU pipeline traces for testing and benchmarking"
+
+[dependencies]
+uscope = { path = "../uscope" }
+rand = "0.8"

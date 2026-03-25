@@ -4,6 +4,7 @@ use crate::checkpoint::{FieldOffsets, StorageState};
 use crate::schema::Schema;
 use crate::segment;
 use crate::state::{self, TimedEvent, TimedItem, TraceState};
+use crate::summary::CounterSummary;
 use crate::types::*;
 use std::fs::File;
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
@@ -58,6 +59,7 @@ pub struct Reader {
     field_offsets: Vec<FieldOffsets>,
     segment_table: Vec<SegmentIndexEntry>,
     string_table: Option<StringTable>,
+    counter_summary: Option<CounterSummary>,
 }
 
 impl Reader {
@@ -168,6 +170,7 @@ impl Reader {
             field_offsets,
             segment_table,
             string_table,
+            counter_summary: None,
         })
     }
 
@@ -193,6 +196,16 @@ impl Reader {
 
     pub fn string_table(&self) -> Option<&StringTable> {
         self.string_table.as_ref()
+    }
+
+    /// Set a pre-computed counter summary (mipmap data).
+    pub fn set_counter_summary(&mut self, summary: CounterSummary) {
+        self.counter_summary = Some(summary);
+    }
+
+    /// Get the counter summary, if one has been computed/loaded.
+    pub fn counter_summary(&self) -> Option<&CounterSummary> {
+        self.counter_summary.as_ref()
     }
 
     /// Look up a DUT property value by key.

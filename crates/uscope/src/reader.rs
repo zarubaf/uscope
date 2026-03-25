@@ -119,6 +119,7 @@ impl Reader {
         // Read section table if finalized
         let mut segment_table = Vec::new();
         let mut string_table = None;
+        let mut counter_summary = None;
 
         if header.flags & F_COMPLETE != 0 && header.section_table_offset != 0 {
             // First pass: read all section entries
@@ -141,6 +142,20 @@ impl Reader {
                     SECTION_STRINGS => {
                         file.seek(SeekFrom::Start(entry.offset))?;
                         string_table = Some(StringTable::read_from(&mut file, entry.size)?);
+                    }
+                    SECTION_COUNTER_SUMMARY => {
+                        file.seek(SeekFrom::Start(entry.offset))?;
+                        let mut data = vec![0u8; entry.size as usize];
+                        file.read_exact(&mut data)?;
+                        match crate::summary::deserialize_counter_summary(&data) {
+                            Ok(summary) => counter_summary = Some(summary),
+                            Err(e) => {
+                                eprintln!(
+                                    "Warning: failed to read embedded counter summary: {}",
+                                    e
+                                );
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -170,7 +185,7 @@ impl Reader {
             field_offsets,
             segment_table,
             string_table,
-            counter_summary: None,
+            counter_summary,
         })
     }
 

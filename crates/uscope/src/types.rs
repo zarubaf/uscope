@@ -48,6 +48,7 @@ pub const SECTION_END: u16 = 0x0000;
 pub const SECTION_SUMMARY: u16 = 0x0001;
 pub const SECTION_STRINGS: u16 = 0x0002;
 pub const SECTION_SEGMENTS: u16 = 0x0003;
+pub const SECTION_COUNTER_SUMMARY: u16 = 0x0010;
 
 // ── Delta actions ──────────────────────────────────────────────────
 

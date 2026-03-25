@@ -5,8 +5,9 @@
 use crate::reader::Reader;
 use crate::state::TimedItem;
 use crate::types::*;
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::collections::HashMap;
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 
 // ── Data structures ────────────────────────────────────────────────
 
@@ -217,6 +218,225 @@ pub fn compute_counter_summary(reader: &mut Reader, period_ps: u64) -> io::Resul
     })
 }
 
+// ── Serialization ─────────────────────────────────────────────────
+
+const COUNTER_SUMMARY_MAGIC: &[u8; 4] = b"CSUM";
+
+/// Serialize a `CounterSummary` to a self-contained byte vector.
+///
+/// Format:
+/// - 4 bytes: magic `b"CSUM"`
+/// - 4 bytes: base_interval_cycles (u32 LE)
+/// - 4 bytes: fan_out (u32 LE)
+/// - 4 bytes: num_counters (u32 LE)
+/// - For each counter:
+///   - 4 bytes: name_len (u32 LE)
+///   - name_len bytes: name (UTF-8)
+///   - 2 bytes: storage_id (u16 LE)
+///   - 4 bytes: num_levels (u32 LE)
+///   - For each level:
+///     - 4 bytes: num_entries (u32 LE)
+///     - For each entry: min_delta(u64) + max_delta(u64) + sum(u64) = 24 bytes
+pub fn serialize_counter_summary(summary: &CounterSummary) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(COUNTER_SUMMARY_MAGIC);
+    buf.write_u32::<LittleEndian>(summary.base_interval_cycles)
+        .unwrap();
+    buf.write_u32::<LittleEndian>(summary.fan_out).unwrap();
+    buf.write_u32::<LittleEndian>(summary.counters.len() as u32)
+        .unwrap();
+
+    for counter in &summary.counters {
+        let name_bytes = counter.name.as_bytes();
+        buf.write_u32::<LittleEndian>(name_bytes.len() as u32)
+            .unwrap();
+        buf.extend_from_slice(name_bytes);
+        buf.write_u16::<LittleEndian>(counter.storage_id).unwrap();
+        buf.write_u32::<LittleEndian>(counter.levels.len() as u32)
+            .unwrap();
+
+        for level in &counter.levels {
+            buf.write_u32::<LittleEndian>(level.len() as u32).unwrap();
+            for entry in level {
+                buf.write_u64::<LittleEndian>(entry.min_delta).unwrap();
+                buf.write_u64::<LittleEndian>(entry.max_delta).unwrap();
+                buf.write_u64::<LittleEndian>(entry.sum).unwrap();
+            }
+        }
+    }
+
+    buf
+}
+
+/// Deserialize a `CounterSummary` from bytes produced by `serialize_counter_summary`.
+pub fn deserialize_counter_summary(data: &[u8]) -> io::Result<CounterSummary> {
+    let mut r = io::Cursor::new(data);
+
+    let mut magic = [0u8; 4];
+    r.read_exact(&mut magic)?;
+    if &magic != COUNTER_SUMMARY_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid counter summary magic (expected CSUM)",
+        ));
+    }
+
+    let base_interval_cycles = r.read_u32::<LittleEndian>()?;
+    let fan_out = r.read_u32::<LittleEndian>()?;
+    let num_counters = r.read_u32::<LittleEndian>()? as usize;
+
+    let mut counters = Vec::with_capacity(num_counters);
+    for _ in 0..num_counters {
+        let name_len = r.read_u32::<LittleEndian>()? as usize;
+        let mut name_bytes = vec![0u8; name_len];
+        r.read_exact(&mut name_bytes)?;
+        let name = String::from_utf8(name_bytes).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid UTF-8 counter name: {}", e),
+            )
+        })?;
+        let storage_id = r.read_u16::<LittleEndian>()?;
+        let num_levels = r.read_u32::<LittleEndian>()? as usize;
+
+        let mut levels = Vec::with_capacity(num_levels);
+        for _ in 0..num_levels {
+            let num_entries = r.read_u32::<LittleEndian>()? as usize;
+            let mut entries = Vec::with_capacity(num_entries);
+            for _ in 0..num_entries {
+                entries.push(MipmapEntry {
+                    min_delta: r.read_u64::<LittleEndian>()?,
+                    max_delta: r.read_u64::<LittleEndian>()?,
+                    sum: r.read_u64::<LittleEndian>()?,
+                });
+            }
+            levels.push(entries);
+        }
+
+        counters.push(CounterMipmap {
+            name,
+            storage_id,
+            levels,
+        });
+    }
+
+    Ok(CounterSummary {
+        base_interval_cycles,
+        fan_out,
+        counters,
+    })
+}
+
+// ── Embedding into .uscope files ──────────────────────────────────
+
+/// Compute counter mipmaps and embed them inside a finalized `.uscope` file.
+///
+/// This must be called **after** `Writer::close()`.  It re-opens the file,
+/// replays all segments to build the mipmap, then appends the serialized
+/// summary data and rewrites the section table so the reader can find it.
+///
+/// `period_ps` is the clock period in picoseconds (used to convert absolute
+/// timestamps to cycle numbers).
+pub fn embed_counter_summary(path: &str, period_ps: u64) -> io::Result<()> {
+    // 1. Open with Reader, compute summary.
+    let mut reader = Reader::open(path)?;
+    let summary = compute_counter_summary(&mut reader, period_ps)?;
+    if summary.counters.is_empty() {
+        return Ok(());
+    }
+    let data = serialize_counter_summary(&summary);
+    // Capture what we need from the reader before dropping it.
+    let header = reader.header().clone();
+    drop(reader);
+
+    // 2. Re-open the file for read+write.
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?;
+
+    // 3. Read existing section table entries.
+    if header.section_table_offset == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file has no section table (not finalized?)",
+        ));
+    }
+
+    file.seek(SeekFrom::Start(header.section_table_offset))?;
+    let mut existing_sections = Vec::new();
+    let mut old_summary_offset: Option<u64> = None;
+    loop {
+        let entry = SectionEntry::read_from(&mut file)?;
+        if entry.section_type == SECTION_END {
+            break;
+        }
+        if entry.section_type == SECTION_COUNTER_SUMMARY {
+            // Remember where the old summary data starts so we can overwrite it.
+            old_summary_offset = Some(entry.offset);
+        } else {
+            existing_sections.push(entry);
+        }
+    }
+
+    // 4. Determine write position: reuse old summary data offset if present,
+    //    otherwise start at the section table offset.
+    let write_start = old_summary_offset.unwrap_or(header.section_table_offset);
+    file.seek(SeekFrom::Start(write_start))?;
+
+    // Write summary data blob.
+    let summary_offset = write_start;
+    let summary_size = data.len() as u64;
+    file.write_all(&data)?;
+
+    // Pad to 8-byte alignment before section table.
+    let pos = file.stream_position()?;
+    let pad = (8 - (pos % 8)) % 8;
+    if pad > 0 {
+        file.write_all(&vec![0u8; pad as usize])?;
+    }
+
+    let new_section_table_offset = file.stream_position()?;
+
+    // Write original section entries + new counter summary entry.
+    for s in &existing_sections {
+        s.write_to(&mut file)?;
+    }
+
+    SectionEntry {
+        section_type: SECTION_COUNTER_SUMMARY,
+        flags: 0,
+        reserved: 0,
+        offset: summary_offset,
+        size: summary_size,
+    }
+    .write_to(&mut file)?;
+
+    // End sentinel.
+    SectionEntry {
+        section_type: SECTION_END,
+        flags: 0,
+        reserved: 0,
+        offset: 0,
+        size: 0,
+    }
+    .write_to(&mut file)?;
+
+    // Truncate the file in case the new content is shorter than the old tail.
+    let end_pos = file.stream_position()?;
+    file.set_len(end_pos)?;
+
+    // 5. Rewrite header with updated section_table_offset.
+    let mut new_header = header;
+    new_header.section_table_offset = new_section_table_offset;
+    file.seek(SeekFrom::Start(0))?;
+    new_header.write_to(&mut file)?;
+
+    file.flush()?;
+
+    Ok(())
+}
+
 // ── Legacy format helpers (unchanged) ──────────────────────────────
 
 /// Read summary header and level descriptors (legacy wire format).
@@ -383,5 +603,219 @@ mod tests {
         assert_eq!(cm.levels[1][0].sum, 4 * 1024);
         assert_eq!(cm.levels[1][0].min_delta, 1);
         assert_eq!(cm.levels[1][0].max_delta, 1);
+    }
+
+    #[test]
+    fn serialize_deserialize_roundtrip() {
+        let summary = CounterSummary {
+            base_interval_cycles: 1024,
+            fan_out: 4,
+            counters: vec![
+                CounterMipmap {
+                    name: "insns".to_string(),
+                    storage_id: 3,
+                    levels: vec![
+                        vec![
+                            MipmapEntry {
+                                min_delta: 1,
+                                max_delta: 5,
+                                sum: 100,
+                            },
+                            MipmapEntry {
+                                min_delta: 0,
+                                max_delta: 10,
+                                sum: 200,
+                            },
+                        ],
+                        vec![MipmapEntry {
+                            min_delta: 0,
+                            max_delta: 10,
+                            sum: 300,
+                        }],
+                    ],
+                },
+                CounterMipmap {
+                    name: "cycles".to_string(),
+                    storage_id: 4,
+                    levels: vec![vec![MipmapEntry {
+                        min_delta: 1,
+                        max_delta: 1,
+                        sum: 1024,
+                    }]],
+                },
+            ],
+        };
+
+        let data = serialize_counter_summary(&summary);
+        let decoded = deserialize_counter_summary(&data).unwrap();
+
+        assert_eq!(decoded.base_interval_cycles, summary.base_interval_cycles);
+        assert_eq!(decoded.fan_out, summary.fan_out);
+        assert_eq!(decoded.counters.len(), summary.counters.len());
+
+        for (orig, dec) in summary.counters.iter().zip(decoded.counters.iter()) {
+            assert_eq!(dec.name, orig.name);
+            assert_eq!(dec.storage_id, orig.storage_id);
+            assert_eq!(dec.levels.len(), orig.levels.len());
+
+            for (ol, dl) in orig.levels.iter().zip(dec.levels.iter()) {
+                assert_eq!(dl.len(), ol.len());
+                for (oe, de) in ol.iter().zip(dl.iter()) {
+                    assert_eq!(de.min_delta, oe.min_delta);
+                    assert_eq!(de.max_delta, oe.max_delta);
+                    assert_eq!(de.sum, oe.sum);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn serialize_deserialize_empty() {
+        let summary = CounterSummary {
+            base_interval_cycles: 512,
+            fan_out: 2,
+            counters: vec![],
+        };
+
+        let data = serialize_counter_summary(&summary);
+        let decoded = deserialize_counter_summary(&data).unwrap();
+
+        assert_eq!(decoded.base_interval_cycles, 512);
+        assert_eq!(decoded.fan_out, 2);
+        assert!(decoded.counters.is_empty());
+    }
+
+    #[test]
+    fn deserialize_bad_magic() {
+        let data = b"BADMrest of data...";
+        let result = deserialize_counter_summary(data);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("magic"), "error should mention magic: {}", msg);
+    }
+
+    #[test]
+    fn embed_counter_summary_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("embedded.uscope");
+
+        let (dut_builder, mut sb, ids) = CpuSchemaBuilder::new("core0")
+            .pipeline_stages(&["Fe", "De", "Ex", "Wb"])
+            .entity_slots(16)
+            .counter("insns")
+            .build();
+        let dut = dut_builder.build(sb.strings_mut());
+        let schema = sb.build();
+
+        let clock_period: u64 = 1000;
+
+        let file = std::fs::File::create(&path).unwrap();
+        let buf = std::io::BufWriter::new(file);
+        let mut w = writer::Writer::create(buf, &dut, &schema, clock_period * 100_000).unwrap();
+        let cpu = CpuWriter::new(ids);
+
+        for c in 0u64..2048 {
+            w.begin_cycle(c * clock_period);
+            cpu.counter_add(&mut w, "insns", 1);
+            w.end_cycle().unwrap();
+        }
+        w.close().unwrap();
+
+        // Before embedding: no counter summary in file.
+        let reader = Reader::open(path.to_str().unwrap()).unwrap();
+        assert!(reader.counter_summary().is_none());
+        drop(reader);
+
+        // Embed counter summary.
+        embed_counter_summary(path.to_str().unwrap(), clock_period).unwrap();
+
+        // Re-open: should now have the summary loaded automatically.
+        let reader2 = Reader::open(path.to_str().unwrap()).unwrap();
+        let loaded_summary = reader2
+            .counter_summary()
+            .expect("summary should be embedded");
+        assert_eq!(loaded_summary.counters.len(), 1);
+        assert_eq!(loaded_summary.counters[0].name, "insns");
+        assert!(loaded_summary.counters[0].levels[0].len() >= 2);
+        assert_eq!(loaded_summary.counters[0].levels[0][0].sum, 1024);
+
+        // The file should still have valid segments and string table.
+        assert!(reader2.segment_count() >= 1);
+    }
+
+    #[test]
+    fn embed_no_counters_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("no_counters_embed.uscope");
+
+        let (dut_builder, mut sb, _ids) = CpuSchemaBuilder::new("core0")
+            .pipeline_stages(&["Fe", "De"])
+            .entity_slots(16)
+            .build();
+        let dut = dut_builder.build(sb.strings_mut());
+        let schema = sb.build();
+
+        let file = std::fs::File::create(&path).unwrap();
+        let buf = std::io::BufWriter::new(file);
+        let mut w = writer::Writer::create(buf, &dut, &schema, 100_000).unwrap();
+        w.begin_cycle(0);
+        w.end_cycle().unwrap();
+        w.close().unwrap();
+
+        let size_before = std::fs::metadata(&path).unwrap().len();
+
+        // Embed should be a no-op (no counters).
+        embed_counter_summary(path.to_str().unwrap(), 1000).unwrap();
+
+        let size_after = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(size_before, size_after, "file should not change");
+
+        let reader = Reader::open(path.to_str().unwrap()).unwrap();
+        assert!(reader.counter_summary().is_none());
+    }
+
+    #[test]
+    fn embed_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("idempotent.uscope");
+
+        let (dut_builder, mut sb, ids) = CpuSchemaBuilder::new("core0")
+            .pipeline_stages(&["Fe", "De", "Ex", "Wb"])
+            .entity_slots(16)
+            .counter("ops")
+            .build();
+        let dut = dut_builder.build(sb.strings_mut());
+        let schema = sb.build();
+
+        let clock_period: u64 = 1000;
+
+        let file = std::fs::File::create(&path).unwrap();
+        let buf = std::io::BufWriter::new(file);
+        let mut w = writer::Writer::create(buf, &dut, &schema, clock_period * 100_000).unwrap();
+        let cpu = CpuWriter::new(ids);
+
+        for c in 0u64..2048 {
+            w.begin_cycle(c * clock_period);
+            cpu.counter_add(&mut w, "ops", 1);
+            w.end_cycle().unwrap();
+        }
+        w.close().unwrap();
+
+        // Embed twice; second call should produce identical result.
+        embed_counter_summary(path.to_str().unwrap(), clock_period).unwrap();
+        let size_first = std::fs::metadata(&path).unwrap().len();
+
+        embed_counter_summary(path.to_str().unwrap(), clock_period).unwrap();
+        let size_second = std::fs::metadata(&path).unwrap().len();
+
+        assert_eq!(
+            size_first, size_second,
+            "embedding twice should be idempotent"
+        );
+
+        let reader = Reader::open(path.to_str().unwrap()).unwrap();
+        let summary = reader.counter_summary().expect("summary should exist");
+        assert_eq!(summary.counters.len(), 1);
+        assert_eq!(summary.counters[0].levels[0][0].sum, 1024);
     }
 }

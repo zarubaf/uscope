@@ -6,7 +6,7 @@ use std::io::{self, Write as IoWrite};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use uscope::protocols::cpu::{CpuSchemaBuilder, CpuWriter};
-use uscope::summary::embed_counter_summary;
+use uscope::summary::embed_trace_summary;
 use uscope::writer::Writer;
 
 fn main() -> io::Result<()> {
@@ -305,12 +305,12 @@ fn main() -> io::Result<()> {
         file_size as f64 / 1_048_576.0
     );
 
-    // Compute and embed counter mipmaps inside the .uscope file.
-    eprint!("Embedding counter mipmaps...");
+    // Compute and embed trace summary (counter mipmaps + instruction density).
+    eprint!("Embedding trace summary...");
     io::stderr().flush().ok();
     let mipmap_start = std::time::Instant::now();
 
-    embed_counter_summary(&output, clock_period as u64)?;
+    embed_trace_summary(&output, clock_period as u64)?;
 
     eprintln!(" done in {:.2}s", mipmap_start.elapsed().as_secs_f64());
 

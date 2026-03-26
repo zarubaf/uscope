@@ -4,7 +4,7 @@ use crate::checkpoint::{FieldOffsets, StorageState};
 use crate::schema::Schema;
 use crate::segment;
 use crate::state::{self, TimedEvent, TimedItem, TraceState};
-use crate::summary::CounterSummary;
+use crate::summary::TraceSummary;
 use crate::types::*;
 use std::fs::File;
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
@@ -59,7 +59,7 @@ pub struct Reader {
     field_offsets: Vec<FieldOffsets>,
     segment_table: Vec<SegmentIndexEntry>,
     string_table: Option<StringTable>,
-    counter_summary: Option<CounterSummary>,
+    trace_summary: Option<TraceSummary>,
 }
 
 impl Reader {
@@ -119,7 +119,7 @@ impl Reader {
         // Read section table if finalized
         let mut segment_table = Vec::new();
         let mut string_table = None;
-        let mut counter_summary = None;
+        let mut trace_summary = None;
 
         if header.flags & F_COMPLETE != 0 && header.section_table_offset != 0 {
             // First pass: read all section entries
@@ -147,13 +147,10 @@ impl Reader {
                         file.seek(SeekFrom::Start(entry.offset))?;
                         let mut data = vec![0u8; entry.size as usize];
                         file.read_exact(&mut data)?;
-                        match crate::summary::deserialize_counter_summary(&data) {
-                            Ok(summary) => counter_summary = Some(summary),
+                        match crate::summary::deserialize_trace_summary(&data) {
+                            Ok(summary) => trace_summary = Some(summary),
                             Err(e) => {
-                                eprintln!(
-                                    "Warning: failed to read embedded counter summary: {}",
-                                    e
-                                );
+                                eprintln!("Warning: failed to read embedded trace summary: {}", e);
                             }
                         }
                     }
@@ -185,7 +182,7 @@ impl Reader {
             field_offsets,
             segment_table,
             string_table,
-            counter_summary,
+            trace_summary,
         })
     }
 
@@ -213,14 +210,24 @@ impl Reader {
         self.string_table.as_ref()
     }
 
-    /// Set a pre-computed counter summary (mipmap data).
-    pub fn set_counter_summary(&mut self, summary: CounterSummary) {
-        self.counter_summary = Some(summary);
+    /// Set a pre-computed trace summary (mipmap data).
+    pub fn set_trace_summary(&mut self, summary: TraceSummary) {
+        self.trace_summary = Some(summary);
     }
 
-    /// Get the counter summary, if one has been computed/loaded.
-    pub fn counter_summary(&self) -> Option<&CounterSummary> {
-        self.counter_summary.as_ref()
+    /// Get the trace summary, if one has been computed/loaded.
+    pub fn trace_summary(&self) -> Option<&TraceSummary> {
+        self.trace_summary.as_ref()
+    }
+
+    /// Backward-compatible alias for `set_trace_summary`.
+    pub fn set_counter_summary(&mut self, summary: TraceSummary) {
+        self.set_trace_summary(summary);
+    }
+
+    /// Backward-compatible alias for `trace_summary`.
+    pub fn counter_summary(&self) -> Option<&TraceSummary> {
+        self.trace_summary()
     }
 
     /// Look up a DUT property value by key.

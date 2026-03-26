@@ -72,6 +72,25 @@ impl TraceSummary {
         }
         (level0.len() as u32) * self.base_interval_cycles
     }
+
+    /// Find the approximate global instruction index for a given cycle.
+    /// Inverse of `row_to_cycle`: sums instruction counts in density buckets
+    /// up to the bucket containing the given cycle.
+    pub fn cycle_to_row(&self, cycle: u32) -> usize {
+        if self.instruction_density.is_empty() {
+            return 0;
+        }
+        let level0 = &self.instruction_density[0];
+        let target_bucket = (cycle / self.base_interval_cycles) as usize;
+        let mut cumulative = 0usize;
+        for (bucket, &count) in level0.iter().enumerate() {
+            if bucket >= target_bucket {
+                break;
+            }
+            cumulative += count as usize;
+        }
+        cumulative
+    }
 }
 
 // ── Computation ────────────────────────────────────────────────────

@@ -173,23 +173,12 @@ fn main() -> io::Result<()> {
         .map(|_| rng.gen_range(0.01..0.2))
         .collect();
 
-    let segment_interval = 50_000u64;
-    let mut instructions_in_segment = 0u64;
     let stall_prob = 0.10;
     let flush_prob = 0.01;
     let mut cycle: u64 = 0;
     let period = clock_period as u64;
     let mut next_entity_id: u32 = 0;
     let mut instr_idx = 0u64;
-
-    // Helper: emit one cycle with all ops inside begin/end.
-    macro_rules! emit_cycle {
-        ($w:expr, $cycle:expr, $period:expr, $body:expr) => {{
-            $w.begin_cycle($cycle * $period);
-            $body;
-            $w.end_cycle()?;
-        }};
-    }
 
     while instr_idx < num_instructions {
         let group_size = (num_instructions - instr_idx).min(fetch_width as u64);

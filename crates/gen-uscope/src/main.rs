@@ -6,6 +6,7 @@ use std::io::{self, Write as IoWrite};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use uscope::protocols::cpu::{CpuSchemaBuilder, CpuWriter};
+use uscope::schema::FieldSpec;
 use uscope::summary::embed_trace_summary;
 use uscope::writer::Writer;
 
@@ -146,6 +147,14 @@ fn main() -> io::Result<()> {
         .fetch_width(fetch_width)
         .entity_slots(512);
 
+    // Add buffers: ROB (128 slots) + 2 issue queues (16 slots each).
+    let rob_size: u16 = 128;
+    let iq_size: u16 = 16;
+    builder = builder
+        .buffer("rob", rob_size, &[("ready", FieldSpec::Bool)])
+        .buffer("iq0", iq_size, &[("ready", FieldSpec::Bool)])
+        .buffer("iq1", iq_size, &[("ready", FieldSpec::Bool)]);
+
     for name in &counter_names {
         builder = builder.counter(name);
     }
@@ -219,6 +228,11 @@ fn main() -> io::Result<()> {
 
             cpu.fetch(&mut w, eid, pc, inst_bits);
             cpu.stage_transition(&mut w, eid, 0); // Enter first stage
+
+            // Place in ROB.
+            let rob_slot = eid as u16 % rob_size;
+            cpu.buffer_set(&mut w, "rob", rob_slot, eid);
+
             group_entities.push((eid, is_flushed, flush_after));
         }
         w.end_cycle()?;
@@ -245,6 +259,18 @@ fn main() -> io::Result<()> {
                     w.begin_cycle(cycle * period);
                     if d == 0 {
                         cpu.stage_transition(&mut w, *eid, si as u8);
+                        // Place in issue queue on issue stage (stage 4).
+                        if si == 4 {
+                            let iq_name = if *eid % 2 == 0 { "iq0" } else { "iq1" };
+                            let iq_slot = (*eid as u16 / 2) % iq_size;
+                            cpu.buffer_set(&mut w, iq_name, iq_slot, *eid);
+                        }
+                        // Clear from issue queue on execute stage (stage 5).
+                        if si == 5 {
+                            let iq_name = if *eid % 2 == 0 { "iq0" } else { "iq1" };
+                            let iq_slot = (*eid as u16 / 2) % iq_size;
+                            cpu.buffer_clear(&mut w, iq_name, iq_slot);
+                        }
                     }
                     w.end_cycle()?;
                 }
@@ -253,6 +279,10 @@ fn main() -> io::Result<()> {
             // Retire or flush (in its own cycle).
             cycle += 1;
             w.begin_cycle(cycle * period);
+            // Clear from ROB on retire/flush.
+            let rob_slot = *eid as u16 % rob_size;
+            cpu.buffer_clear(&mut w, "rob", rob_slot);
+
             if *is_flushed {
                 cpu.flush(&mut w, *eid, 0);
             } else {

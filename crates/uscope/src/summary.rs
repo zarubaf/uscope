@@ -81,11 +81,16 @@ impl TraceSummary {
             return 0;
         }
         let level0 = &self.instruction_density[0];
-        let target_bucket = (cycle / self.base_interval_cycles) as usize;
+        let base = self.base_interval_cycles;
+        let target_bucket = (cycle / base) as usize;
         let mut cumulative = 0usize;
         for (bucket, &count) in level0.iter().enumerate() {
             if bucket >= target_bucket {
-                break;
+                // Interpolate within this bucket based on cycle position.
+                let cycle_in_bucket = cycle.saturating_sub(bucket as u32 * base);
+                let fraction = cycle_in_bucket as f64 / base as f64;
+                let offset = (fraction * count as f64) as usize;
+                return cumulative + offset;
             }
             cumulative += count as usize;
         }

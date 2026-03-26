@@ -96,6 +96,32 @@ impl TraceSummary {
         }
         cumulative
     }
+    /// Get the approximate cumulative counter value at a given cycle.
+    /// Prefix-sums level-0 `sum` fields up to the target bucket.
+    pub fn counter_value_at(&self, counter_idx: usize, cycle: u32) -> u64 {
+        if counter_idx >= self.counters.len() {
+            return 0;
+        }
+        let mipmap = &self.counters[counter_idx];
+        if mipmap.levels.is_empty() {
+            return 0;
+        }
+        let level0 = &mipmap.levels[0];
+        let base = self.base_interval_cycles;
+        let target_bucket = (cycle / base) as usize;
+        let mut cumulative = 0u64;
+        for (bucket, entry) in level0.iter().enumerate() {
+            if bucket >= target_bucket {
+                // Interpolate within the bucket.
+                let cycle_in_bucket = cycle.saturating_sub(bucket as u32 * base);
+                let fraction = cycle_in_bucket as f64 / base as f64;
+                cumulative += (fraction * entry.sum as f64) as u64;
+                break;
+            }
+            cumulative += entry.sum;
+        }
+        cumulative
+    }
 }
 
 // ── Computation ────────────────────────────────────────────────────

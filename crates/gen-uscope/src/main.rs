@@ -249,6 +249,11 @@ fn main() -> io::Result<()> {
                 if rng.gen_bool(stall_prob) {
                     dur += rng.gen_range(1..=3);
                 }
+                // Issue stage (4): longer duration so IQs have visible occupancy.
+                if si == 4 {
+                    dur += rng.gen_range(1..=4);
+                }
+                // Execute stage (5): variable duration.
                 if si == 5 {
                     dur += rng.gen_range(0..=2);
                 }

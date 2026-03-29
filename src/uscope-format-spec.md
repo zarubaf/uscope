@@ -1,6 +1,6 @@
 # µScope Trace Format Specification
 
-**Version:** 0.1-draft
+**Version:** 0.2-draft
 **Magic:** `uSCP` (0x75 0x53 0x43 0x50)
 **Byte order:** Little-endian (all multi-byte integers throughout the file,
 including field values in event payloads, checkpoint slot data, and summary
@@ -141,7 +141,7 @@ Offset 0. Fixed size: **48 bytes.**
 typedef struct {
     uint8_t  magic[4];              // "uSCP" = {0x75, 0x53, 0x43, 0x50}
     uint16_t version_major;         // 0
-    uint16_t version_minor;         // 1
+    uint16_t version_minor;         // 2
     uint64_t flags;                 // §2.1
     uint64_t total_time_ps;         // total trace duration in picoseconds (0 until finalized)
     uint32_t num_segments;          // updated after each segment flush
@@ -412,7 +412,8 @@ typedef struct {
 | Bit  | Name        | Description                                    |
 | ---- | ----------- | ---------------------------------------------- |
 | 0    | `SF_SPARSE` | Checkpoints store only valid entries + bitmask |
-| 1-15 | Reserved    |                                                |
+| 1    | `SF_BUFFER` | Buffer storage — sparse storage used as a named buffer (e.g., ROB, issue queue). The protocol layer uses this flag to detect buffer storages for dedicated visualization. |
+| 2-15 | Reserved    |                                                |
 
 For `SF_SPARSE` storages, slot validity is tracked by the transport:
 - `DA_SLOT_SET` on any field of an invalid slot implicitly marks it valid.
@@ -488,10 +489,11 @@ Written at finalization only (when `F_COMPLETE` is set).
 
 ```c
 enum section_type : uint16_t {
-    SECTION_END          = 0x0000,
-    SECTION_SUMMARY      = 0x0001,
-    SECTION_STRINGS      = 0x0002,
-    SECTION_SEGMENTS     = 0x0003,
+    SECTION_END              = 0x0000,
+    SECTION_SUMMARY          = 0x0001,
+    SECTION_STRINGS          = 0x0002,
+    SECTION_SEGMENTS         = 0x0003,
+    SECTION_COUNTER_SUMMARY  = 0x0010,  // trace summary (counter mipmaps + instruction density)
 };
 
 typedef struct {
@@ -511,41 +513,62 @@ and the section table does not exist. Readers must use the segment chain
 
 ---
 
-## 6. Summary Section (Mipmap Pyramid)
+## 6. Trace Summary Section (TSUM)
 
-Written at finalization only.
+Written at finalization into a `SECTION_COUNTER_SUMMARY` section. Contains
+instruction density mipmaps and per-counter mipmaps in a self-contained blob.
 
-### 6.1 Summary Header
+### 6.1 TSUM Wire Format
 
-```c
-typedef struct {
-    uint32_t num_levels;
-    uint32_t fan_out;               // reduction factor per level
-    uint32_t entry_size;            // computed from summary field defs
-    uint32_t reserved;
-    uint64_t base_interval_ps;      // level 0 bucket size in picoseconds
-    // level_desc_t levels[num_levels];
-} summary_header_t;
+```
+Offset  Size   Field
+──────  ─────  ──────────────────────────────────
+0       4      magic: b"TSUM" (0x54 0x53 0x55 0x4D)
+4       4      base_interval_cycles (u32 LE)
+8       4      fan_out (u32 LE)
+12      8      total_instructions (u64 LE)
+                                                    ─── 20 bytes fixed header ───
 
-typedef struct {
-    uint64_t offset;                // relative to summary section start
-    uint32_t num_entries;
-    uint32_t reserved;
-} level_desc_t;                     // 16 bytes
+20      4      num_density_levels (u32 LE)
+        ...    For each density level:
+                 4 bytes: num_entries (u32 LE)
+                 num_entries × 4 bytes: instruction counts (u32 LE each)
+
+        4      num_counters (u32 LE)
+        ...    For each counter:
+                 4 bytes: name_len (u32 LE)
+                 name_len bytes: name (UTF-8, not null-terminated)
+                 2 bytes: storage_id (u16 LE)
+                 4 bytes: num_levels (u32 LE)
+                 For each level:
+                   4 bytes: num_entries (u32 LE)
+                   num_entries × 24 bytes: mipmap entries
 ```
 
-### 6.2 Summary Entry
+### 6.2 Mipmap Entry
 
-Layout determined by `summary_field_def_t[]`:
+Each mipmap entry is 24 bytes:
 
-```c
-// Pseudo-layout:
-typedef struct {
-    uint64_t time_start_ps;
-    // For each summary_field_def:
-    //   value at field's size bytes
-} summary_entry_t;
+| Offset | Size | Field       | Description                              |
+| ------ | ---- | ----------- | ---------------------------------------- |
+| 0      | 8    | `min_delta` | Minimum per-cycle delta in this bucket   |
+| 8      | 8    | `max_delta` | Maximum per-cycle delta in this bucket   |
+| 16     | 8    | `sum`       | Total delta accumulated in this bucket   |
+
+### 6.3 Backward Compatibility (CSUM)
+
+Readers must also accept the legacy `CSUM` magic (`b"CSUM"`, 0x43 0x53 0x55
+0x4D) which predates instruction density support. The CSUM layout is:
+
 ```
+0       4      magic: b"CSUM"
+4       4      base_interval_cycles (u32 LE)
+8       4      fan_out (u32 LE)
+12      4      num_counters (u32 LE)
+        ...    Counter mipmaps (same format as TSUM)
+```
+
+When reading CSUM, set `total_instructions = 0` and `instruction_density = []`.
 
 ---
 
@@ -1107,6 +1130,12 @@ algorithm (§9 of that document).
 |         |            | — Preserves call order of ops and events within a cycle   |
 |         |            | — `version_minor` bumped to 2                             |
 |         |            | — `F_COMPACT_DELTAS` ignored when interleaved is set      |
+| 4.4     | 2026-03-29 | Trace summary + buffer flag:                              |
+|         |            | — `SF_BUFFER` storage flag (bit 1)                        |
+|         |            | — `SECTION_COUNTER_SUMMARY` section type (0x0010)         |
+|         |            | — TraceSummary (TSUM) replaces abstract summary §6        |
+|         |            | — Instruction density mipmap + counter mipmaps            |
+|         |            | — Backward-compatible CSUM reader for legacy files        |
 
 ---
 

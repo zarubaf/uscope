@@ -78,7 +78,9 @@ impl Schema {
             sp_offset += EnumDef::HEADER_SIZE + e.values.len() * EnumValue::SIZE;
         }
         for s in &self.storages {
-            sp_offset += StorageDef::HEADER_SIZE + s.fields.len() * FieldDef::SIZE;
+            sp_offset += StorageDef::HEADER_SIZE
+                + s.fields.len() * FieldDef::SIZE
+                + s.properties.len() * FieldDef::SIZE;
         }
         for e in &self.events {
             sp_offset += EventDef::HEADER_SIZE + e.fields.len() * FieldDef::SIZE;
@@ -261,6 +263,23 @@ impl SchemaBuilder {
         flags: u16,
         fields: &[(&str, FieldSpec)],
     ) -> u16 {
+        self.storage_with_properties(name, scope_id, num_slots, flags, fields, &[])
+    }
+
+    /// Add a storage definition with storage-level properties (v0.3). Returns storage_id.
+    ///
+    /// Each property is `(name, spec, role, pair_id)` where role is one of
+    /// `PROP_ROLE_PLAIN`, `PROP_ROLE_HEAD_PTR`, `PROP_ROLE_TAIL_PTR` and
+    /// pair_id groups head/tail pointers into pairs.
+    pub fn storage_with_properties(
+        &mut self,
+        name: &str,
+        scope_id: u16,
+        num_slots: u16,
+        flags: u16,
+        fields: &[(&str, FieldSpec)],
+        properties: &[(&str, FieldSpec, u8, u8)],
+    ) -> u16 {
         let id = self.storages.len() as u16;
         let name_off = self.strings.insert(name);
         let field_defs: Vec<FieldDef> = fields
@@ -269,7 +288,20 @@ impl SchemaBuilder {
                 name: self.strings.insert(n),
                 field_type: spec.field_type(),
                 enum_id: spec.enum_id(),
-                reserved: [0; 4],
+                role: 0,
+                pair_id: 0,
+                reserved: [0; 2],
+            })
+            .collect();
+        let prop_defs: Vec<FieldDef> = properties
+            .iter()
+            .map(|(n, spec, role, pair_id)| FieldDef {
+                name: self.strings.insert(n),
+                field_type: spec.field_type(),
+                enum_id: spec.enum_id(),
+                role: *role,
+                pair_id: *pair_id,
+                reserved: [0; 2],
             })
             .collect();
         self.storages.push(StorageDef {
@@ -279,7 +311,10 @@ impl SchemaBuilder {
             num_fields: field_defs.len() as u16,
             flags,
             scope_id,
+            num_properties: prop_defs.len() as u16,
+            reserved_v3: 0,
             fields: field_defs,
+            properties: prop_defs,
         });
         id
     }
@@ -294,7 +329,9 @@ impl SchemaBuilder {
                 name: self.strings.insert(n),
                 field_type: spec.field_type(),
                 enum_id: spec.enum_id(),
-                reserved: [0; 4],
+                role: 0,
+                pair_id: 0,
+                reserved: [0; 2],
             })
             .collect();
         self.events.push(EventDef {
@@ -443,6 +480,50 @@ mod tests {
             Some("core_clk")
         );
         assert_eq!(decoded.get_string(decoded.scopes[1].name), Some("core0"));
+    }
+
+    #[test]
+    fn schema_roundtrip_with_properties() {
+        let mut builder = SchemaBuilder::new();
+        builder.clock_domain("core_clk", 200);
+        builder.scope("root", None, None, None);
+        builder.scope("core0", Some(0), Some("cpu"), Some(0));
+        builder.storage_with_properties(
+            "rob",
+            1,
+            128,
+            SF_BUFFER,
+            &[("entity_id", FieldSpec::U32)],
+            &[
+                ("retire_ptr", FieldSpec::U16, PROP_ROLE_HEAD_PTR, 0),
+                ("allocate_ptr", FieldSpec::U16, PROP_ROLE_TAIL_PTR, 0),
+            ],
+        );
+
+        let schema = builder.build();
+
+        // Serialize
+        let mut buf = Vec::new();
+        schema.write_to(&mut buf).unwrap();
+
+        // Deserialize
+        let decoded = Schema::read_from(&mut Cursor::new(&buf), buf.len()).unwrap();
+
+        assert_eq!(decoded.storages.len(), 1);
+        assert_eq!(decoded.storages[0].num_slots, 128);
+        assert_eq!(decoded.storages[0].fields.len(), 1);
+        assert_eq!(decoded.storages[0].num_properties, 2);
+        assert_eq!(decoded.storages[0].properties.len(), 2);
+
+        // Check property names round-trip
+        assert_eq!(
+            decoded.get_string(decoded.storages[0].properties[0].name),
+            Some("retire_ptr")
+        );
+        assert_eq!(
+            decoded.get_string(decoded.storages[0].properties[1].name),
+            Some("allocate_ptr")
+        );
     }
 
     #[test]

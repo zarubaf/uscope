@@ -296,6 +296,10 @@ fn apply_op(
         DA_SLOT_ADD => {
             storages[sid].add_field_at(slot_index, &field_offsets[sid], field_index, value);
         }
+        DA_PROP_SET => {
+            // field_index is used as prop_index, slot_index is unused
+            storages[sid].set_property(&field_offsets[sid], field_index, value);
+        }
         _ => {}
     }
 }
@@ -313,13 +317,54 @@ mod tests {
             num_fields: 1,
             flags: SF_SPARSE,
             scope_id: 0,
+            num_properties: 0,
+            reserved_v3: 0,
             fields: vec![FieldDef {
                 name: 0,
                 field_type: FieldType::U32 as u8,
                 enum_id: 0,
-                reserved: [0; 4],
+                role: 0,
+                pair_id: 0,
+                reserved: [0; 2],
             }],
+            properties: vec![],
         }
+    }
+
+    #[test]
+    fn replay_prop_set() {
+        let mut def = make_storage_def();
+        def.num_properties = 1;
+        def.properties = vec![FieldDef {
+            name: 0,
+            field_type: FieldType::U16 as u8,
+            enum_id: 0,
+            role: 0,
+            pair_id: 0,
+            reserved: [0; 2],
+        }];
+        let offsets = vec![FieldOffsets::from_storage_def(&def)];
+        let mut storages = vec![StorageState::new(&def)];
+
+        // Build a v0.2 interleaved delta with a DA_PROP_SET op
+        let mut delta = Vec::new();
+        // time_delta=0
+        leb128::encode_u64_vec(0, &mut delta);
+        // num_items=1
+        delta.extend_from_slice(&1u16.to_le_bytes());
+        // Wide op: DA_PROP_SET
+        delta.push(TAG_WIDE_OP);
+        delta.push(DA_PROP_SET); // action
+        delta.extend_from_slice(&0u16.to_le_bytes()); // storage_id=0
+        delta.extend_from_slice(&0u16.to_le_bytes()); // slot_index=0 (unused)
+        delta.extend_from_slice(&0u16.to_le_bytes()); // field_index=0 (prop_index)
+        delta.extend_from_slice(&42u64.to_le_bytes()); // value=42
+
+        let (_final_time, items) =
+            replay_deltas_v2(&delta, &mut storages, &offsets, 0, None).unwrap();
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(storages[0].get_property(&offsets[0], 0), 42);
     }
 
     #[test]

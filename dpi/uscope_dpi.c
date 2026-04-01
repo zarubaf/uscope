@@ -41,6 +41,7 @@ static const uint8_t SEG_MAGIC[4] = {0x75, 0x53, 0x45, 0x47}; /* "uSEG" */
 #define DA_SLOT_SET   0x01
 #define DA_SLOT_CLEAR 0x02
 #define DA_SLOT_ADD   0x03
+#define DA_PROP_SET   0x04
 
 #define SF_SPARSE 0x0001
 
@@ -166,6 +167,8 @@ typedef struct {
   uint16_t name; /* string pool offset */
   uint8_t  type;
   uint8_t  enum_id;
+  uint8_t  role;    /* 0=plain, 1=HEAD_PTR, 2=TAIL_PTR */
+  uint8_t  pair_id; /* groups head/tail pointers into pairs */
 } field_def_t;
 
 typedef struct {
@@ -200,7 +203,9 @@ typedef struct {
   uint16_t    num_fields;
   uint16_t    flags;
   uint16_t    scope_id;
+  uint16_t    num_properties;
   field_def_t fields[MAX_FIELDS];
+  field_def_t properties[MAX_FIELDS];
 } storage_def_t;
 
 typedef struct {
@@ -268,6 +273,18 @@ uint8_t uscope_schema_add_enum(uscope_schema_def_t *s, const char *name, const c
 uint16_t uscope_schema_add_storage(uscope_schema_def_t *s, const char *name, uint16_t scope_id, uint16_t num_slots,
                                    uint16_t flags, uint16_t num_fields, const char **field_names,
                                    const uint8_t *field_types, const uint8_t *field_enum_ids) {
+  return uscope_schema_add_storage_with_properties(s, name, scope_id, num_slots, flags,
+                                                    num_fields, field_names, field_types, field_enum_ids,
+                                                    0, NULL, NULL, NULL, NULL, NULL);
+}
+
+uint16_t uscope_schema_add_storage_with_properties(
+    uscope_schema_def_t *s, const char *name, uint16_t scope_id, uint16_t num_slots,
+    uint16_t flags, uint16_t num_fields, const char **field_names,
+    const uint8_t *field_types, const uint8_t *field_enum_ids,
+    uint16_t num_properties, const char **prop_names,
+    const uint8_t *prop_types, const uint8_t *prop_enum_ids,
+    const uint8_t *prop_roles, const uint8_t *prop_pair_ids) {
   uint16_t       id = s->num_storages++;
   storage_def_t *st = &s->storages[id];
   st->name          = sp_insert(&s->sp, name);
@@ -276,10 +293,18 @@ uint16_t uscope_schema_add_storage(uscope_schema_def_t *s, const char *name, uin
   st->num_fields    = num_fields;
   st->flags         = flags;
   st->scope_id      = scope_id;
+  st->num_properties = num_properties;
   for (uint16_t i = 0; i < num_fields; i++) {
     st->fields[i].name    = sp_insert(&s->sp, field_names[i]);
     st->fields[i].type    = field_types[i];
     st->fields[i].enum_id = field_enum_ids ? field_enum_ids[i] : 0;
+  }
+  for (uint16_t i = 0; i < num_properties; i++) {
+    st->properties[i].name    = sp_insert(&s->sp, prop_names[i]);
+    st->properties[i].type    = prop_types[i];
+    st->properties[i].enum_id = prop_enum_ids ? prop_enum_ids[i] : 0;
+    st->properties[i].role    = prop_roles ? prop_roles[i] : 0;
+    st->properties[i].pair_id = prop_pair_ids ? prop_pair_ids[i] : 0;
   }
   return id;
 }
@@ -332,15 +357,16 @@ static int storage_slot_size(const storage_def_t *st) {
 
 static void write_schema(FILE *f, const uscope_schema_def_t *s) {
   /* Compute string pool offset */
-  uint16_t sp_offset = 14; /* header */
+  uint16_t sp_offset = 12; /* SchemaHeader: 1+1+2+2+2+2+2 = 12 bytes */
   sp_offset          += s->num_clocks * 8;
   sp_offset          += s->num_scopes * 12;
   for (uint8_t i = 0; i < s->num_enums; i++) sp_offset += 4 + s->enums[i].num_values * 4;
-  for (uint16_t i = 0; i < s->num_storages; i++) sp_offset += 12 + s->storages[i].num_fields * 8;
+  for (uint16_t i = 0; i < s->num_storages; i++)
+    sp_offset += 16 + s->storages[i].num_fields * 8 + s->storages[i].num_properties * 8;
   for (uint16_t i = 0; i < s->num_events; i++) sp_offset += 8 + s->events[i].num_fields * 8;
   /* No summary fields for now */
 
-  /* Schema header (14 bytes) */
+  /* Schema header (12 bytes) */
   write_u8(f, s->num_enums);
   write_u8(f, s->num_clocks);
   write_u16(f, s->num_scopes);
@@ -379,7 +405,7 @@ static void write_schema(FILE *f, const uscope_schema_def_t *s) {
     }
   }
 
-  /* Storages */
+  /* Storages (v0.3: 16-byte header) */
   for (uint16_t i = 0; i < s->num_storages; i++) {
     const storage_def_t *st = &s->storages[i];
     write_u16(f, st->name);
@@ -388,12 +414,23 @@ static void write_schema(FILE *f, const uscope_schema_def_t *s) {
     write_u16(f, st->num_fields);
     write_u16(f, st->flags);
     write_u16(f, st->scope_id);
+    write_u16(f, st->num_properties); /* v0.3 */
+    write_u16(f, 0);                  /* v0.3 reserved */
     for (uint16_t j = 0; j < st->num_fields; j++) {
       write_u16(f, st->fields[j].name);
       write_u8(f, st->fields[j].type);
       write_u8(f, st->fields[j].enum_id);
       uint8_t reserved[4] = {0, 0, 0, 0};
       fwrite(reserved, 1, 4, f);
+    }
+    for (uint16_t j = 0; j < st->num_properties; j++) {
+      write_u16(f, st->properties[j].name);
+      write_u8(f, st->properties[j].type);
+      write_u8(f, st->properties[j].enum_id);
+      write_u8(f, st->properties[j].role);
+      write_u8(f, st->properties[j].pair_id);
+      uint8_t reserved[2] = {0, 0};
+      fwrite(reserved, 1, 2, f);
     }
   }
 
@@ -456,6 +493,12 @@ typedef struct {
   uint8_t *data;          /* [num_slots * slot_size] */
   int     *field_offsets; /* [num_fields] */
   uint8_t *field_types;   /* [num_fields] */
+  /* v0.3: storage-level properties */
+  uint16_t num_properties;
+  int      property_size;
+  uint8_t *property_data;  /* [property_size] */
+  int     *prop_offsets;   /* [num_properties] */
+  uint8_t *prop_types;     /* [num_properties] */
 } storage_state_t;
 
 /* String table entry */
@@ -548,6 +591,26 @@ static void state_init(storage_state_t *st, const storage_def_t *def) {
 
   st->valid = calloc(def->num_slots, 1);
   st->data  = calloc(def->num_slots, off > 0 ? off : 1);
+
+  /* v0.3: properties */
+  st->num_properties = def->num_properties;
+  if (def->num_properties > 0) {
+    st->prop_offsets = calloc(def->num_properties, sizeof(int));
+    st->prop_types   = calloc(def->num_properties, sizeof(uint8_t));
+    int poff = 0;
+    for (uint16_t i = 0; i < def->num_properties; i++) {
+      st->prop_offsets[i] = poff;
+      st->prop_types[i]   = def->properties[i].type;
+      poff                += field_type_size(def->properties[i].type);
+    }
+    st->property_size = poff;
+    st->property_data = calloc(1, poff > 0 ? poff : 1);
+  } else {
+    st->prop_offsets   = NULL;
+    st->prop_types     = NULL;
+    st->property_size  = 0;
+    st->property_data  = NULL;
+  }
 }
 
 static void state_free(storage_state_t *st) {
@@ -555,9 +618,12 @@ static void state_free(storage_state_t *st) {
   free(st->data);
   free(st->field_offsets);
   free(st->field_types);
+  free(st->property_data);
+  free(st->prop_offsets);
+  free(st->prop_types);
 }
 
-/* Snapshot valid + data arrays for checkpointing (field_offsets/field_types are shared, not owned). */
+/* Snapshot valid + data + property arrays for checkpointing (offsets/types are shared, not owned). */
 static void state_snapshot(storage_state_t *dst, const storage_state_t *src) {
   *dst = *src;
   dst->valid = malloc(src->num_slots);
@@ -565,11 +631,18 @@ static void state_snapshot(storage_state_t *dst, const storage_state_t *src) {
   size_t data_size = (size_t)src->num_slots * (src->slot_size > 0 ? src->slot_size : 1);
   dst->data = malloc(data_size);
   memcpy(dst->data, src->data, data_size);
+  if (src->property_size > 0) {
+    dst->property_data = malloc(src->property_size);
+    memcpy(dst->property_data, src->property_data, src->property_size);
+  } else {
+    dst->property_data = NULL;
+  }
 }
 
 static void state_snapshot_free(storage_state_t *st) {
   free(st->valid);
   free(st->data);
+  free(st->property_data);
 }
 
 static void state_set_field(storage_state_t *st, uint16_t slot, uint16_t field, uint64_t value) {
@@ -599,6 +672,13 @@ static void state_clear_slot(storage_state_t *st, uint16_t slot) {
   if (slot >= st->num_slots) return;
   st->valid[slot] = 0;
   memset(st->data + (size_t)slot * st->slot_size, 0, st->slot_size);
+}
+
+static void state_set_property(storage_state_t *st, uint16_t prop_index, uint64_t value) {
+  if (prop_index >= st->num_properties) return;
+  uint8_t *p  = st->property_data + st->prop_offsets[prop_index];
+  int      sz = field_type_size(st->prop_types[prop_index]);
+  for (int i = 0; i < sz; i++) p[i] = (uint8_t)(value >> (i * 8));
 }
 
 /* ── Checkpoint serialization ───────────────────────────────────── */
@@ -633,6 +713,12 @@ static uint32_t write_checkpoint_to_buf(uint8_t *buf, const storage_state_t *sta
       size_t total = (size_t)st->num_slots * st->slot_size;
       memcpy(p, st->data, total);
       p += total;
+    }
+
+    /* v0.3: append property data after slot data */
+    if (st->property_size > 0) {
+      memcpy(p, st->property_data, st->property_size);
+      p += st->property_size;
     }
 
     /* Fill in checkpoint_block header */
@@ -676,7 +762,7 @@ uscope_writer_t *uscope_writer_open(const char *path, const uscope_dut_property_
   /* Write file header (placeholder) */
   fwrite(MAGIC, 1, 4, fp);
   write_u16(fp, 0); /* version_major */
-  write_u16(fp, 2); /* version_minor */
+  write_u16(fp, 3); /* version_minor */
   write_u64(fp, w->flags);
   write_u64(fp, 0); /* total_time_ps */
   write_u32(fp, 0); /* num_segments */
@@ -981,6 +1067,21 @@ void uscope_slot_add(uscope_writer_t *w, uint16_t storage_id, uint16_t slot, uin
       break;
     }
   }
+}
+
+void uscope_prop_set(uscope_writer_t *w, uint16_t storage_id, uint16_t prop_index, uint64_t value) {
+  assert(w->in_cycle);
+  if (w->num_ops < MAX_OPS_PER_FRAME) {
+    uint16_t    idx               = w->num_ops++;
+    delta_op_t *op                = &w->ops[idx];
+    op->action                    = DA_PROP_SET;
+    op->storage_id                = storage_id;
+    op->slot_index                = 0;
+    op->field_index               = prop_index;
+    op->value                     = value;
+    w->item_order[w->num_items++] = idx;
+  }
+  if (storage_id < w->num_storages) state_set_property(&w->states[storage_id], prop_index, value);
 }
 
 void uscope_event(uscope_writer_t *w, uint16_t event_type_id, const void *payload, uint32_t payload_size) {

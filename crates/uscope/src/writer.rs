@@ -252,6 +252,23 @@ impl<W: Write + Seek> Writer<W> {
         }
     }
 
+    /// Set a storage-level property value (v0.3).
+    pub fn prop_set(&mut self, storage_id: u16, prop_index: u16, value: u64) {
+        assert!(self.in_cycle, "prop_set called outside a cycle");
+        self.current_frame.items.push(FrameItem::Op(DeltaOp {
+            action: DA_PROP_SET,
+            reserved: 0,
+            storage_id,
+            slot_index: 0, // unused for properties
+            field_index: prop_index,
+            value,
+        }));
+        let sid = storage_id as usize;
+        if sid < self.storage_states.len() {
+            self.storage_states[sid].set_property(&self.field_offsets[sid], prop_index, value);
+        }
+    }
+
     /// Add a value to a field in a storage slot.
     pub fn slot_add(&mut self, storage_id: u16, slot: u16, field: u16, value: u64) {
         assert!(self.in_cycle, "slot_add called outside a cycle");
@@ -601,6 +618,72 @@ mod tests {
         assert!(header.flags & F_COMPLETE != 0);
         assert_eq!(header.total_time_ps, 4000);
         assert!(header.num_segments >= 1);
+    }
+
+    #[test]
+    fn write_with_properties() {
+        let mut sb = SchemaBuilder::new();
+        sb.clock_domain("clk", 1000);
+        sb.scope("root", None, None, None);
+        sb.scope("core0", Some(0), Some("cpu"), Some(0));
+
+        sb.storage_with_properties(
+            "rob",
+            1,
+            16,
+            SF_BUFFER,
+            &[("entity_id", FieldSpec::U32)],
+            &[
+                ("retire_ptr", FieldSpec::U16, PROP_ROLE_HEAD_PTR, 0),
+                ("allocate_ptr", FieldSpec::U16, PROP_ROLE_TAIL_PTR, 0),
+            ],
+        );
+
+        let mut dut_builder = DutDescBuilder::new();
+        dut_builder.property("dut_name", "test_core");
+        let dut = dut_builder.build(sb.strings_mut());
+        let schema = sb.build();
+
+        let buf = Cursor::new(Vec::new());
+        let mut w = Writer::create(buf, &dut, &schema, 100_000).unwrap();
+
+        // Cycle 1: set some properties and a slot
+        w.begin_cycle(1000);
+        w.prop_set(0, 0, 5); // retire_ptr = 5
+        w.prop_set(0, 1, 10); // allocate_ptr = 10
+        w.slot_set(0, 5, 0, 42); // entity_id = 42 in slot 5
+        w.end_cycle().unwrap();
+
+        // Cycle 2: update properties
+        w.begin_cycle(2000);
+        w.prop_set(0, 0, 6); // retire_ptr = 6
+        w.end_cycle().unwrap();
+
+        let result = w.close().unwrap();
+        let data = result.into_inner();
+
+        // Read back and verify
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("props.uscope");
+        std::fs::write(&path, &data).unwrap();
+
+        let mut reader = crate::reader::Reader::open(path.to_str().unwrap()).unwrap();
+        let header = reader.header().clone();
+        assert!(header.flags & F_COMPLETE != 0);
+        assert_eq!(header.total_time_ps, 2000);
+
+        // Verify schema properties survived roundtrip
+        let schema = reader.schema();
+        assert_eq!(schema.storages[0].num_properties, 2);
+        assert_eq!(schema.storages[0].properties.len(), 2);
+
+        // Replay segment and verify property state
+        let (storages, items) = reader.segment_replay(0).unwrap();
+        assert!(!items.is_empty());
+        // After replay, properties should reflect the latest values
+        let offsets = reader.field_offsets();
+        assert_eq!(storages[0].get_property(&offsets[0], 0), 6); // retire_ptr
+        assert_eq!(storages[0].get_property(&offsets[0], 1), 10); // allocate_ptr
     }
 
     #[test]

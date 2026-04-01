@@ -12,6 +12,8 @@ pub struct BufferInfo {
     pub storage_id: u16,
     pub entity_id_field: u16,
     pub fields: Vec<(String, u16)>,
+    /// Storage-level property names and their indices (v0.3).
+    pub properties: Vec<(String, u16)>,
 }
 
 /// IDs assigned during schema construction.
@@ -56,6 +58,8 @@ struct BufferDef {
     name: String,
     num_slots: u16,
     extra_fields: Vec<(String, FieldSpec)>,
+    /// (name, spec, role, pair_id) — role/pair_id for pointer pair annotations.
+    properties: Vec<(String, FieldSpec, u8, u8)>,
 }
 
 impl CpuSchemaBuilder {
@@ -130,6 +134,34 @@ impl CpuSchemaBuilder {
             extra_fields: extra_fields
                 .iter()
                 .map(|(n, f)| (n.to_string(), f.clone()))
+                .collect(),
+            properties: Vec::new(),
+        });
+        self
+    }
+
+    /// Add a buffer with storage-level properties (v0.3).
+    ///
+    /// Each property is `(name, spec, role, pair_id)`. Use `PROP_ROLE_HEAD_PTR`
+    /// / `PROP_ROLE_TAIL_PTR` and matching `pair_id` to annotate circular buffer
+    /// pointer pairs.
+    pub fn buffer_with_properties(
+        mut self,
+        name: &str,
+        num_slots: u16,
+        extra_fields: &[(&str, FieldSpec)],
+        properties: &[(&str, FieldSpec, u8, u8)],
+    ) -> Self {
+        self.buffers.push(BufferDef {
+            name: name.to_owned(),
+            num_slots,
+            extra_fields: extra_fields
+                .iter()
+                .map(|(n, f)| (n.to_string(), f.clone()))
+                .collect(),
+            properties: properties
+                .iter()
+                .map(|(n, f, r, p)| (n.to_string(), f.clone(), *r, *p))
                 .collect(),
         });
         self
@@ -211,7 +243,19 @@ impl CpuSchemaBuilder {
             for (n, f) in &buf.extra_fields {
                 fields.push((n.as_str(), f.clone()));
             }
-            let sid = sb.storage(&buf.name, scope_id, buf.num_slots, SF_BUFFER, &fields);
+            let props: Vec<(&str, FieldSpec, u8, u8)> = buf
+                .properties
+                .iter()
+                .map(|(n, f, r, p)| (n.as_str(), f.clone(), *r, *p))
+                .collect();
+            let sid = sb.storage_with_properties(
+                &buf.name,
+                scope_id,
+                buf.num_slots,
+                SF_BUFFER,
+                &fields,
+                &props,
+            );
             let entity_id_field = 0u16;
             let extra: Vec<(String, u16)> = buf
                 .extra_fields
@@ -219,11 +263,18 @@ impl CpuSchemaBuilder {
                 .enumerate()
                 .map(|(i, (n, _))| (n.clone(), (i + 1) as u16))
                 .collect();
+            let prop_info: Vec<(String, u16)> = buf
+                .properties
+                .iter()
+                .enumerate()
+                .map(|(i, (n, _, _, _))| (n.clone(), i as u16))
+                .collect();
             buffer_ids.push(BufferInfo {
                 name: buf.name.clone(),
                 storage_id: sid,
                 entity_id_field,
                 fields: extra,
+                properties: prop_info,
             });
         }
 
@@ -421,6 +472,27 @@ impl CpuWriter {
                 for (fname, fidx) in &buf.fields {
                     if fname == field_name {
                         w.slot_set(buf.storage_id, slot, *fidx, value);
+                        return;
+                    }
+                }
+                return;
+            }
+        }
+    }
+
+    /// Set a storage-level property on a buffer (v0.3).
+    pub fn buffer_set_property<W: Write + Seek>(
+        &self,
+        w: &mut Writer<W>,
+        name: &str,
+        prop_name: &str,
+        value: u64,
+    ) {
+        for buf in &self.ids.buffers {
+            if buf.name == name {
+                for (pname, pidx) in &buf.properties {
+                    if pname == prop_name {
+                        w.prop_set(buf.storage_id, *pidx, value);
                         return;
                     }
                 }

@@ -9,7 +9,7 @@ pub const MAGIC: [u8; 4] = [0x75, 0x53, 0x43, 0x50]; // "uSCP"
 pub const SEG_MAGIC: [u8; 4] = [0x75, 0x53, 0x45, 0x47]; // "uSEG"
 
 pub const VERSION_MAJOR: u16 = 0;
-pub const VERSION_MINOR: u16 = 2;
+pub const VERSION_MINOR: u16 = 3;
 
 // ── File header flags ──────────────────────────────────────────────
 
@@ -55,6 +55,7 @@ pub const SECTION_COUNTER_SUMMARY: u16 = 0x0010;
 pub const DA_SLOT_SET: u8 = 0x01;
 pub const DA_SLOT_CLEAR: u8 = 0x02;
 pub const DA_SLOT_ADD: u8 = 0x03;
+pub const DA_PROP_SET: u8 = 0x04;
 
 // ── Field types ────────────────────────────────────────────────────
 
@@ -126,7 +127,7 @@ impl FileHeader {
             magic: MAGIC,
             version_major: VERSION_MAJOR,
             version_minor: VERSION_MINOR,
-            flags: F_COMPRESSED | F_INTERLEAVED_DELTAS, // LZ4 + interleaved v0.2 by default
+            flags: F_COMPRESSED | F_INTERLEAVED_DELTAS, // LZ4 + interleaved by default
             total_time_ps: 0,
             num_segments: 0,
             preamble_end: 0,
@@ -297,7 +298,7 @@ pub struct SchemaHeader {
 }
 
 impl SchemaHeader {
-    pub const SIZE: usize = 14;
+    pub const SIZE: usize = 12;
 
     pub fn write_to<W: Write>(&self, w: &mut W) -> io::Result<()> {
         w.write_u8(self.num_enums)?;
@@ -458,12 +459,23 @@ impl EnumDef {
     }
 }
 
+/// Property role constants for pointer pair annotations.
+pub const PROP_ROLE_PLAIN: u8 = 0;
+pub const PROP_ROLE_HEAD_PTR: u8 = 1;
+pub const PROP_ROLE_TAIL_PTR: u8 = 2;
+
 #[derive(Debug, Clone)]
 pub struct FieldDef {
     pub name: u16, // string pool offset
     pub field_type: u8,
     pub enum_id: u8, // if type==FT_ENUM, else 0
-    pub reserved: [u8; 4],
+    /// Property role: 0=plain, 1=HEAD_PTR, 2=TAIL_PTR.
+    /// Only meaningful for storage properties; 0 for regular fields.
+    pub role: u8,
+    /// Pointer pair ID: properties with the same pair_id form a head/tail pair.
+    /// Only meaningful when role != 0.
+    pub pair_id: u8,
+    pub reserved: [u8; 2],
 }
 
 impl FieldDef {
@@ -473,6 +485,8 @@ impl FieldDef {
         w.write_u16::<LittleEndian>(self.name)?;
         w.write_u8(self.field_type)?;
         w.write_u8(self.enum_id)?;
+        w.write_u8(self.role)?;
+        w.write_u8(self.pair_id)?;
         w.write_all(&self.reserved)?;
         Ok(())
     }
@@ -481,12 +495,16 @@ impl FieldDef {
         let name = r.read_u16::<LittleEndian>()?;
         let field_type = r.read_u8()?;
         let enum_id = r.read_u8()?;
-        let mut reserved = [0u8; 4];
+        let role = r.read_u8()?;
+        let pair_id = r.read_u8()?;
+        let mut reserved = [0u8; 2];
         r.read_exact(&mut reserved)?;
         Ok(Self {
             name,
             field_type,
             enum_id,
+            role,
+            pair_id,
             reserved,
         })
     }
@@ -499,12 +517,15 @@ pub struct StorageDef {
     pub num_slots: u16,
     pub num_fields: u16,
     pub flags: u16,
-    pub scope_id: u16, // 0xFFFF = root
+    pub scope_id: u16,       // 0xFFFF = root
+    pub num_properties: u16, // v0.3: number of storage-level properties
+    pub reserved_v3: u16,    // v0.3: reserved
     pub fields: Vec<FieldDef>,
+    pub properties: Vec<FieldDef>, // v0.3: property definitions
 }
 
 impl StorageDef {
-    pub const HEADER_SIZE: usize = 12;
+    pub const HEADER_SIZE: usize = 16; // v0.3: was 12
 
     pub fn is_sparse(&self) -> bool {
         self.flags & SF_SPARSE != 0
@@ -522,6 +543,14 @@ impl StorageDef {
             .sum()
     }
 
+    /// Size of all property values in bytes (sum of property field sizes).
+    pub fn property_data_size(&self) -> usize {
+        self.properties
+            .iter()
+            .map(|f| FieldType::from_u8(f.field_type).map_or(0, |t| t.size()))
+            .sum()
+    }
+
     pub fn write_to<W: Write>(&self, w: &mut W) -> io::Result<()> {
         w.write_u16::<LittleEndian>(self.name)?;
         w.write_u16::<LittleEndian>(self.storage_id)?;
@@ -529,8 +558,13 @@ impl StorageDef {
         w.write_u16::<LittleEndian>(self.num_fields)?;
         w.write_u16::<LittleEndian>(self.flags)?;
         w.write_u16::<LittleEndian>(self.scope_id)?;
+        w.write_u16::<LittleEndian>(self.num_properties)?;
+        w.write_u16::<LittleEndian>(self.reserved_v3)?;
         for f in &self.fields {
             f.write_to(w)?;
+        }
+        for p in &self.properties {
+            p.write_to(w)?;
         }
         Ok(())
     }
@@ -542,9 +576,15 @@ impl StorageDef {
         let num_fields = r.read_u16::<LittleEndian>()?;
         let flags = r.read_u16::<LittleEndian>()?;
         let scope_id = r.read_u16::<LittleEndian>()?;
+        let num_properties = r.read_u16::<LittleEndian>()?;
+        let reserved_v3 = r.read_u16::<LittleEndian>()?;
         let mut fields = Vec::with_capacity(num_fields as usize);
         for _ in 0..num_fields {
             fields.push(FieldDef::read_from(r)?);
+        }
+        let mut properties = Vec::with_capacity(num_properties as usize);
+        for _ in 0..num_properties {
+            properties.push(FieldDef::read_from(r)?);
         }
         Ok(Self {
             name,
@@ -553,7 +593,10 @@ impl StorageDef {
             num_fields,
             flags,
             scope_id,
+            num_properties,
+            reserved_v3,
             fields,
+            properties,
         })
     }
 }

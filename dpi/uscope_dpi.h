@@ -75,6 +75,23 @@ uint16_t uscope_schema_add_storage(uscope_schema_def_t *s, const char *name, uin
                                    const uint8_t *field_types, const uint8_t *field_enum_ids);
 
 /*
+ * Add a storage with properties (v0.3). Returns storage_id.
+ * Properties are scalar values attached to the storage, not per-slot.
+ * prop_roles: 0=plain, 1=HEAD_PTR, 2=TAIL_PTR (NULL = all plain).
+ * prop_pair_ids: pointer pair grouping (NULL = all 0).
+ */
+#define USCOPE_PROP_ROLE_PLAIN    0
+#define USCOPE_PROP_ROLE_HEAD_PTR 1
+#define USCOPE_PROP_ROLE_TAIL_PTR 2
+uint16_t uscope_schema_add_storage_with_properties(
+    uscope_schema_def_t *s, const char *name, uint16_t scope_id, uint16_t num_slots,
+    uint16_t flags, uint16_t num_fields, const char **field_names,
+    const uint8_t *field_types, const uint8_t *field_enum_ids,
+    uint16_t num_properties, const char **prop_names,
+    const uint8_t *prop_types, const uint8_t *prop_enum_ids,
+    const uint8_t *prop_roles, const uint8_t *prop_pair_ids);
+
+/*
  * Add an event type. Fields given as parallel arrays.
  * Returns event_type_id.
  */
@@ -106,6 +123,9 @@ void uscope_slot_add(uscope_writer_t *w, uint16_t storage_id, uint16_t slot, uin
 void uscope_event(uscope_writer_t *w, uint16_t event_type_id, const void *payload, uint32_t payload_size);
 
 void uscope_end_cycle(uscope_writer_t *w);
+
+/* Set a storage-level property (v0.3). */
+void uscope_prop_set(uscope_writer_t *w, uint16_t storage_id, uint16_t prop_index, uint64_t value);
 
 /* ── String table ───────────────────────────────────────────────── */
 

@@ -15,12 +15,17 @@ pub struct StorageState {
     pub valid: Vec<bool>,
     /// Flat array: slot_data[slot_index * slot_size .. (slot_index+1) * slot_size].
     pub data: Vec<u8>,
+    /// Storage-level property values (tightly packed, v0.3).
+    pub property_data: Vec<u8>,
+    /// Total size of property data in bytes.
+    pub property_size: usize,
 }
 
 impl StorageState {
     pub fn new(storage_def: &StorageDef) -> Self {
         let slot_size = storage_def.slot_size();
         let num_slots = storage_def.num_slots as usize;
+        let property_size = storage_def.property_data_size();
         Self {
             storage_id: storage_def.storage_id,
             num_slots: storage_def.num_slots,
@@ -28,6 +33,8 @@ impl StorageState {
             slot_size,
             valid: vec![false; num_slots],
             data: vec![0u8; num_slots * slot_size],
+            property_data: vec![0u8; property_size],
+            property_size,
         }
     }
 
@@ -144,6 +151,11 @@ impl StorageState {
             payload.extend_from_slice(&self.data[..self.num_slots as usize * self.slot_size]);
         }
 
+        // v0.3: append property data after slot data
+        if self.property_size > 0 {
+            payload.extend_from_slice(&self.property_data[..self.property_size]);
+        }
+
         let block = CheckpointBlock {
             storage_id: self.storage_id,
             reserved: 0,
@@ -160,6 +172,7 @@ impl StorageState {
         let mut data = vec![0u8; size as usize];
         r.read_exact(&mut data)?;
 
+        let slot_data_end;
         if self.is_sparse {
             let mask_bytes = (self.num_slots as usize + 7) / 8;
             if data.len() < mask_bytes {
@@ -169,7 +182,7 @@ impl StorageState {
                 ));
             }
             let mask = &data[..mask_bytes];
-            let mut cursor = &data[mask_bytes..];
+            let mut pos = mask_bytes;
 
             self.valid.fill(false);
             self.data.fill(0);
@@ -178,7 +191,7 @@ impl StorageState {
                 let is_valid = (mask[i / 8] >> (i % 8)) & 1 != 0;
                 self.valid[i] = is_valid;
                 if is_valid {
-                    if cursor.len() < self.slot_size {
+                    if data.len() - pos < self.slot_size {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             "checkpoint truncated",
@@ -186,10 +199,11 @@ impl StorageState {
                     }
                     let base = i * self.slot_size;
                     self.data[base..base + self.slot_size]
-                        .copy_from_slice(&cursor[..self.slot_size]);
-                    cursor = &cursor[self.slot_size..];
+                        .copy_from_slice(&data[pos..pos + self.slot_size]);
+                    pos += self.slot_size;
                 }
             }
+            slot_data_end = pos;
         } else {
             let expected = self.num_slots as usize * self.slot_size;
             if data.len() < expected {
@@ -200,6 +214,17 @@ impl StorageState {
             }
             self.data[..expected].copy_from_slice(&data[..expected]);
             self.valid.fill(true);
+            slot_data_end = expected;
+        }
+
+        // v0.3: read property data from trailing bytes
+        if self.property_size > 0 {
+            let remaining = data.len() - slot_data_end;
+            if remaining >= self.property_size {
+                self.property_data[..self.property_size]
+                    .copy_from_slice(&data[slot_data_end..slot_data_end + self.property_size]);
+            }
+            // If not enough trailing bytes, properties stay zero-initialized (forward compat).
         }
         Ok(())
     }
@@ -212,6 +237,12 @@ pub struct FieldOffsets {
     pub offsets: Vec<usize>,
     /// Type of each field.
     pub types: Vec<FieldType>,
+    /// Byte offset of each property in the property data block (v0.3).
+    pub prop_offsets: Vec<usize>,
+    /// Type of each property (v0.3).
+    pub prop_types: Vec<FieldType>,
+    /// Total size of all properties in bytes (v0.3).
+    pub prop_size: usize,
 }
 
 impl FieldOffsets {
@@ -225,7 +256,24 @@ impl FieldOffsets {
             types.push(ft);
             offset += ft.size();
         }
-        Self { offsets, types }
+
+        let mut prop_offsets = Vec::with_capacity(storage_def.properties.len());
+        let mut prop_types = Vec::with_capacity(storage_def.properties.len());
+        let mut prop_offset = 0;
+        for f in &storage_def.properties {
+            prop_offsets.push(prop_offset);
+            let ft = FieldType::from_u8(f.field_type).unwrap_or(FieldType::U8);
+            prop_types.push(ft);
+            prop_offset += ft.size();
+        }
+
+        Self {
+            offsets,
+            types,
+            prop_offsets,
+            prop_types,
+            prop_size: prop_offset,
+        }
     }
 
     pub fn field_type(&self, field_index: u16) -> FieldType {
@@ -284,6 +332,52 @@ impl StorageState {
         self.set_field_at(slot, offsets, field_index, current.wrapping_add(value));
     }
 
+    /// Set a storage-level property value (v0.3).
+    pub fn set_property(&mut self, offsets: &FieldOffsets, prop_index: u16, value: u64) {
+        let pi = prop_index as usize;
+        if pi >= offsets.prop_types.len() {
+            return;
+        }
+        let ft = offsets.prop_types[pi];
+        let base = offsets.prop_offsets[pi];
+        let data = &mut self.property_data[base..];
+        match ft {
+            FieldType::U8 | FieldType::I8 | FieldType::Bool | FieldType::Enum => {
+                data[0] = value as u8;
+            }
+            FieldType::U16 | FieldType::I16 => {
+                data[..2].copy_from_slice(&(value as u16).to_le_bytes());
+            }
+            FieldType::U32 | FieldType::I32 | FieldType::StringRef => {
+                data[..4].copy_from_slice(&(value as u32).to_le_bytes());
+            }
+            FieldType::U64 | FieldType::I64 => {
+                data[..8].copy_from_slice(&value.to_le_bytes());
+            }
+        }
+    }
+
+    /// Get a storage-level property value (v0.3).
+    pub fn get_property(&self, offsets: &FieldOffsets, prop_index: u16) -> u64 {
+        let pi = prop_index as usize;
+        if pi >= offsets.prop_types.len() {
+            return 0;
+        }
+        let ft = offsets.prop_types[pi];
+        let base = offsets.prop_offsets[pi];
+        let data = &self.property_data[base..];
+        match ft {
+            FieldType::U8 | FieldType::I8 | FieldType::Bool | FieldType::Enum => data[0] as u64,
+            FieldType::U16 | FieldType::I16 => u16::from_le_bytes([data[0], data[1]]) as u64,
+            FieldType::U32 | FieldType::I32 | FieldType::StringRef => {
+                u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as u64
+            }
+            FieldType::U64 | FieldType::I64 => u64::from_le_bytes([
+                data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
+            ]),
+        }
+    }
+
     /// Get a field value using precomputed offsets.
     pub fn get_field_at(&self, slot: u16, offsets: &FieldOffsets, field_index: u16) -> u64 {
         let slot_idx = slot as usize;
@@ -319,20 +413,27 @@ mod tests {
             num_fields: 2,
             flags: SF_SPARSE,
             scope_id: 0,
+            num_properties: 0,
+            reserved_v3: 0,
             fields: vec![
                 FieldDef {
                     name: 0,
                     field_type: FieldType::U32 as u8,
                     enum_id: 0,
-                    reserved: [0; 4],
+                    role: 0,
+                    pair_id: 0,
+                    reserved: [0; 2],
                 },
                 FieldDef {
                     name: 0,
                     field_type: FieldType::U64 as u8,
                     enum_id: 0,
-                    reserved: [0; 4],
+                    role: 0,
+                    pair_id: 0,
+                    reserved: [0; 2],
                 },
             ],
+            properties: vec![],
         }
     }
 
@@ -400,6 +501,67 @@ mod tests {
         assert_eq!(state2.get_field_at(1, &offsets, 0), 42);
         assert_eq!(state2.get_field_at(1, &offsets, 1), 0x1234);
         assert_eq!(state2.get_field_at(3, &offsets, 0), 99);
+    }
+
+    #[test]
+    fn checkpoint_roundtrip_with_properties() {
+        let mut def = make_test_storage();
+        def.num_properties = 2;
+        def.properties = vec![
+            FieldDef {
+                name: 0,
+                field_type: FieldType::U16 as u8,
+                enum_id: 0,
+                role: 0,
+                pair_id: 0,
+                reserved: [0; 2],
+            },
+            FieldDef {
+                name: 0,
+                field_type: FieldType::U32 as u8,
+                enum_id: 0,
+                role: 0,
+                pair_id: 0,
+                reserved: [0; 2],
+            },
+        ];
+        let offsets = FieldOffsets::from_storage_def(&def);
+        let mut state = StorageState::new(&def);
+
+        // Set slot data
+        state.set_field_at(1, &offsets, 0, 42);
+        state.set_field_at(1, &offsets, 1, 0x1234);
+
+        // Set property data
+        state.set_property(&offsets, 0, 5); // u16 property
+        state.set_property(&offsets, 1, 99); // u32 property
+
+        assert_eq!(state.get_property(&offsets, 0), 5);
+        assert_eq!(state.get_property(&offsets, 1), 99);
+
+        let ft: Vec<FieldType> = def
+            .fields
+            .iter()
+            .map(|f| FieldType::from_u8(f.field_type).unwrap())
+            .collect();
+
+        let mut buf = Vec::new();
+        state.write_checkpoint(&mut buf, &ft).unwrap();
+
+        // Read back
+        let mut state2 = StorageState::new(&def);
+        let mut cursor = std::io::Cursor::new(&buf);
+        let block = CheckpointBlock::read_from(&mut cursor).unwrap();
+        state2.read_checkpoint(&mut cursor, block.size).unwrap();
+
+        // Verify slot data
+        assert!(state2.slot_valid(1));
+        assert_eq!(state2.get_field_at(1, &offsets, 0), 42);
+        assert_eq!(state2.get_field_at(1, &offsets, 1), 0x1234);
+
+        // Verify property data
+        assert_eq!(state2.get_property(&offsets, 0), 5);
+        assert_eq!(state2.get_property(&offsets, 1), 99);
     }
 
     #[test]

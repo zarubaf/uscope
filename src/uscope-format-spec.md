@@ -1,6 +1,6 @@
 # µScope Trace Format Specification
 
-**Version:** 0.2-draft
+**Version:** 0.3-draft
 **Magic:** `uSCP` (0x75 0x53 0x43 0x50)
 **Byte order:** Little-endian (all multi-byte integers throughout the file,
 including field values in event payloads, checkpoint slot data, and summary
@@ -305,7 +305,7 @@ typedef struct {
     //   event_def_t             event_types[num_event_types]  (variable-size)
     //   summary_field_def_t     summary_fields[num_summary_fields]
     //   <string pool>
-} schema_header_t;                  // 14 bytes
+} schema_header_t;                  // 12 bytes
 ```
 
 ### 4.2 Field Types
@@ -403,9 +403,23 @@ typedef struct {
     uint16_t num_fields;
     uint16_t flags;                 // §4.6.1
     uint16_t scope_id;              // owning scope, 0xFFFF = root-level
+    uint16_t num_properties;        // v0.3: number of storage-level properties
+    uint16_t reserved;              // v0.3: must be 0
     // field_def_t fields[num_fields];
-} storage_def_t;                    // 12 bytes + fields
+    // field_def_t properties[num_properties];   // v0.3
+} storage_def_t;                    // 16 bytes + fields + properties
 ```
+
+#### 4.6.2 Storage Properties (v0.3)
+
+Storage properties are named, typed scalar values attached to a storage
+(not per-slot). They are checkpointed and updated via `DA_PROP_SET` deltas.
+Use cases include buffer pointers (retire_ptr, allocate_ptr) and other
+storage-level metadata that changes each cycle.
+
+Properties are defined in the schema as `field_def_t` entries appended after
+the slot field definitions. Each property has a name, type, and optional
+enum_id, following the same rules as slot fields.
 
 #### 4.6.1 Storage Flags
 
@@ -700,6 +714,7 @@ typedef struct {
 checkpoint_block_t { storage_id, size }
 uint8_t  valid_mask[ceil(num_slots/8)];
 // For each set bit: slot_data[slot_size]
+// v0.3: property_data[property_data_size] (if num_properties > 0)
 ```
 
 #### 8.5.2 Dense Storage Block
@@ -707,7 +722,13 @@ uint8_t  valid_mask[ceil(num_slots/8)];
 ```
 checkpoint_block_t { storage_id, size }
 // slot_data[slot_size] × num_slots
+// v0.3: property_data[property_data_size] (if num_properties > 0)
 ```
+
+For storages with `num_properties > 0`, property values are appended after
+slot data as tightly-packed field values (same packing rules as slot data).
+The `size` field in the checkpoint block covers the total payload including
+property data.
 
 ### 8.6 Delta Format
 
@@ -751,6 +772,7 @@ enum delta_action : uint8_t {
     DA_SLOT_SET     = 0x01,         // set a field value
     DA_SLOT_CLEAR   = 0x02,         // mark slot invalid (sparse only)
     DA_SLOT_ADD     = 0x03,         // add value to field (for counters etc.)
+    DA_PROP_SET     = 0x04,         // v0.3: set a storage-level property
 };
 
 typedef struct {
@@ -758,7 +780,7 @@ typedef struct {
     uint8_t  reserved;
     uint16_t storage_id;
     uint16_t slot_index;
-    uint16_t field_index;           // ignored for DA_SLOT_CLEAR
+    uint16_t field_index;           // ignored for DA_SLOT_CLEAR; prop_index for DA_PROP_SET
     uint64_t value;                 // ignored for DA_SLOT_CLEAR
 } delta_op_t;                       // 16 bytes
 ```
@@ -1095,7 +1117,7 @@ algorithm (§9 of that document).
 |         |            | — Summary source/aggregation semantics removed            |
 |         |            | — Two string pools merged into one                        |
 |         |            | — DUT descriptor simplified (vendor/version = properties) |
-|         |            | — Delta actions: 7 → 3 (SET, CLEAR, ADD)                  |
+|         |            | — Delta actions: 7 → 3 (SET, CLEAR, ADD); 4 in v0.3      |
 |         |            | — Section types: 7 → 4                                    |
 |         |            | — LEB128 delta-encoded cycle in cycle frames              |
 |         |            | — Append-only segment chain with `tail_offset`            |
@@ -1136,6 +1158,14 @@ algorithm (§9 of that document).
 |         |            | — TraceSummary (TSUM) replaces abstract summary §6        |
 |         |            | — Instruction density mipmap + counter mipmaps            |
 |         |            | — Backward-compatible CSUM reader for legacy files        |
+| 4.5     | 2026-04-01 | Storage properties (v0.3):                                |
+|         |            | — `StorageDef` header: 12 → 16 bytes                      |
+|         |            | — `num_properties` + `reserved` fields added              |
+|         |            | — `FieldDef[num_properties]` appended after slot fields   |
+|         |            | — `DA_PROP_SET` delta action (0x04) for property updates  |
+|         |            | — Checkpoint blocks include property data after slot data |
+|         |            | — `version_minor` bumped to 3                             |
+|         |            | — `SchemaHeader` size corrected: 14 → 12 bytes           |
 
 ---
 
@@ -1147,7 +1177,7 @@ algorithm (§9 of that document).
 | **Chunk**           | A typed, length-prefixed block in the preamble. Unknown chunk types are skipped for forward compatibility.        |
 | **Clock domain**    | A named clock with a period in picoseconds. Scopes are assigned to clock domains for cycle-number display.        |
 | **Cycle frame**     | One timestamp's worth of delta operations and events. v0.1: separate op/event arrays (§8.6.1). v0.2: interleaved tagged items preserving call order (§8.6.6). |
-| **Delta**           | A single state change within a cycle frame (`DA_SLOT_SET`, `DA_SLOT_CLEAR`, or `DA_SLOT_ADD`).                    |
+| **Delta**           | A single state change within a cycle frame (`DA_SLOT_SET`, `DA_SLOT_CLEAR`, `DA_SLOT_ADD`, or `DA_PROP_SET`).     |
 | **DUT**             | Device Under Test. The hardware being traced.                                                                     |
 | **Event**           | A timestamped occurrence with a schema-defined typed payload. Fire-and-forget (no persistent state).              |
 | **Finalization**    | The process of writing summary, string table, segment table, and section table at trace close. Sets `F_COMPLETE`. |

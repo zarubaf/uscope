@@ -18,6 +18,9 @@
 static const uint8_t MAGIC[4]     = {0x75, 0x53, 0x43, 0x50}; /* "uSCP" */
 static const uint8_t SEG_MAGIC[4] = {0x75, 0x53, 0x45, 0x47}; /* "uSEG" */
 
+#define VERSION_MAJOR 0
+#define VERSION_MINOR 3
+
 #define F_COMPLETE           (1ULL << 0)
 #define F_COMPRESSED         (1ULL << 1)
 #define F_HAS_STRINGS        (1ULL << 2)
@@ -761,8 +764,8 @@ uscope_writer_t *uscope_writer_open(const char *path, const uscope_dut_property_
 
   /* Write file header (placeholder) */
   fwrite(MAGIC, 1, 4, fp);
-  write_u16(fp, 0); /* version_major */
-  write_u16(fp, 3); /* version_minor */
+  write_u16(fp, VERSION_MAJOR);
+  write_u16(fp, VERSION_MINOR);
   write_u64(fp, w->flags);
   write_u64(fp, 0); /* total_time_ps */
   write_u32(fp, 0); /* num_segments */
@@ -821,8 +824,8 @@ uscope_writer_t *uscope_writer_open(const char *path, const uscope_dut_property_
   /* Update header with preamble_end */
   fseek(fp, 0, SEEK_SET);
   fwrite(MAGIC, 1, 4, fp);
-  write_u16(fp, 0);
-  write_u16(fp, 2);
+  write_u16(fp, VERSION_MAJOR);
+  write_u16(fp, VERSION_MINOR);
   write_u64(fp, w->flags);
   write_u64(fp, 0);
   write_u32(fp, 0);
@@ -972,8 +975,8 @@ static void flush_segment(uscope_writer_t *w) {
   long cur = ftell(w->fp);
   fseek(w->fp, 0, SEEK_SET);
   fwrite(MAGIC, 1, 4, w->fp);
-  write_u16(w->fp, 0);
-  write_u16(w->fp, 2);
+  write_u16(w->fp, VERSION_MAJOR);
+  write_u16(w->fp, VERSION_MINOR);
   write_u64(w->fp, w->flags);
   write_u64(w->fp, w->total_time_ps);
   write_u32(w->fp, w->num_segments);
@@ -1469,8 +1472,8 @@ void uscope_writer_close(uscope_writer_t *w) {
 
   fseek(w->fp, 0, SEEK_SET);
   fwrite(MAGIC, 1, 4, w->fp);
-  write_u16(w->fp, 0);
-  write_u16(w->fp, 2);
+  write_u16(w->fp, VERSION_MAJOR);
+  write_u16(w->fp, VERSION_MINOR);
   write_u64(w->fp, w->flags);
   write_u64(w->fp, w->total_time_ps);
   write_u32(w->fp, w->num_segments);

@@ -1,0 +1,14 @@
+[package]
+name = "uscope-cpu"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "CPU protocol library for µScope traces: schema resolution, entity lifecycle, counters, buffers"
+
+[dependencies]
+uscope = { path = "../uscope" }
+instruction-decoder = { git = "https://github.com/ics-jku/instruction-decoder", optional = true }
+
+[features]
+default = ["decode"]
+decode = ["instruction-decoder"]

@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/uscope",
+    "crates/uscope-cpu",
     "crates/konata2uscope",
     "crates/gen-uscope",
 ]

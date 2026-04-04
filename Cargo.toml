@@ -2,6 +2,7 @@
 members = [
     "crates/uscope",
     "crates/uscope-cpu",
+    "crates/uscope-cli",
     "crates/konata2uscope",
     "crates/gen-uscope",
 ]

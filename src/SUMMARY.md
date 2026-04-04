@@ -8,9 +8,12 @@
 
 # API Reference
 
-- [Rust Crate API](./rust-api.md)
-- [C DPI Library API](./c-api.md)
+- [uscope (Transport)](./rust-api.md)
+- [uscope-cpu (CPU Protocol)](./uscope-cpu-api.md)
+- [C DPI Library](./c-api.md)
 
 # Tools
 
+- [uscope-cli (CLI Inspector)](./uscope-cli.md)
+- [uscope-mcp (MCP Server)](./uscope-mcp.md)
 - [konata2uscope](./konata2uscope.md)

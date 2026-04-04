@@ -77,14 +77,11 @@ pub fn buffer_state_at(
         if storage.is_sparse && !storage.valid.get(slot as usize).copied().unwrap_or(false) {
             continue;
         }
-        let entity_id = storage.get_field_at(slot, &offsets, 0);
-        if entity_id == 0 {
-            continue;
-        }
         let mut field_values = Vec::with_capacity(num_fields as usize);
         for fi in 0..num_fields {
             field_values.push(storage.get_field_at(slot, &offsets, fi));
         }
+        let entity_id = storage.get_field_at(slot, &offsets, 0);
 
         // Look up entity fields via pre-built map (O(1) per slot).
         let mut entity_fields = Vec::new();
@@ -92,9 +89,7 @@ pub fn buffer_state_at(
             if let Some(&es_slot) = entity_slot_map.get(&entity_id) {
                 for (fi, name) in entity_field_names.iter().enumerate().skip(2) {
                     let val = es.get_field_at(es_slot, eo, fi as u16);
-                    if val != 0 {
-                        entity_fields.push((name.clone(), val));
-                    }
+                    entity_fields.push((name.clone(), val));
                 }
             }
         }
